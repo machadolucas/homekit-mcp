@@ -2,1425 +2,751 @@ import Foundation
 import HomeKit
 import Network
 
+/// Loopback-only MCP server (Streamable HTTP, JSON responses) over the HomeKit framework.
+///
+/// This fork deliberately exposes **organisation** tools only: list homes, rooms and
+/// accessories; move accessories between rooms; rename accessories and rooms; add rooms.
+/// It has no tools that read or write accessory characteristics (power, locks, doors,
+/// thermostats). Device control belongs to Home Assistant.
+///
+/// Security model: binds to 127.0.0.1 only, rejects any request carrying an `Origin`
+/// header and any `Host` header that is not a loopback name, so a web page in a local
+/// browser cannot drive it (DNS rebinding / CSRF). There is no authentication beyond
+/// "a process on this Mac".
 class HTTPMCPServer: NSObject, HMHomeManagerDelegate {
+    static let defaultPort: UInt16 = 3040
+    static let serverName = "homekit-mcp"
+    static let serverVersion = "2.0.0"
+    static let supportedProtocolVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
+
+    private static let maxRequestBytes = 1_048_576
+    private static let writeTimeout: TimeInterval = 10
+
     private let homeManager = HMHomeManager()
-    private var isReady = false
-    private let port: UInt16 = 8080
+    private var homesLoaded = false
+    let port: UInt16
     private var listener: NWListener?
-    private var connections: [NWConnection] = []
-    private let encoder = JSONEncoder()
-    
+
     override init() {
+        let env = ProcessInfo.processInfo.environment["HOMEKIT_MCP_PORT"].flatMap(UInt16.init)
+        port = env ?? Self.defaultPort
         super.init()
-        print("🚀 [MCP] Initializing HomeKit MCP Server...")
+        log("Starting \(Self.serverName) \(Self.serverVersion) on 127.0.0.1:\(port)")
         homeManager.delegate = self
-        setupHTTPServer()
+        startListener()
     }
-    
-    private func setupHTTPServer() {
+
+    deinit {
+        listener?.cancel()
+    }
+
+    // MARK: - HMHomeManagerDelegate
+
+    func homeManagerDidUpdateHomes(_ manager: HMHomeManager) {
+        homesLoaded = true
+        let summary = manager.homes
+            .map { "\($0.name) (\($0.accessories.count) accessories, \($0.rooms.count) rooms)" }
+            .joined(separator: ", ")
+        log("Homes loaded: \(manager.homes.count) [\(summary)]")
+    }
+
+    func homeManager(_ manager: HMHomeManager, didUpdate status: HMHomeManagerAuthorizationStatus) {
+        log("HomeKit authorization status: \(describe(status))")
+    }
+
+    // MARK: - Listener
+
+    private func startListener() {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
-        
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            log("Invalid port \(port)")
+            return
+        }
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: nwPort)
+
         do {
-            guard let port = NWEndpoint.Port(rawValue: port) else {
-                print("Failed to create port \(self.port)")
-                return
-            }
-            listener = try NWListener(using: parameters, on: port)
-            listener?.stateUpdateHandler = { state in
+            let listener = try NWListener(using: parameters)
+            listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    print("HTTP MCP Server listening on port \(self.port)")
+                    self?.log("Listening on 127.0.0.1:\(self?.port ?? 0)")
                 case .failed(let error):
-                    print("HTTP Server failed: \(error)")
+                    self?.log("Listener failed: \(error); exiting so launchd restarts us")
+                    exit(1)
                 default:
                     break
                 }
             }
-            
-            listener?.newConnectionHandler = { connection in
-                self.handleNewConnection(connection)
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.accept(connection)
             }
-            
-            listener?.start(queue: .main)
+            listener.start(queue: .main)
+            self.listener = listener
         } catch {
-            print("Failed to create listener: \(error)")
+            log("Failed to create listener: \(error); exiting")
+            exit(1)
         }
     }
-    
-    func homeManagerDidUpdateHomes(_ manager: HMHomeManager) {
-        print("🏠 [HomeKit] Homes updated. Found \(manager.homes.count) homes:")
-        for home in manager.homes {
-            print("   - \(home.name): \(home.accessories.count) accessories, \(home.rooms.count) rooms")
-        }
-        isReady = true
-    }
-    
-    private func handleNewConnection(_ connection: NWConnection) {
-        connections.append(connection)
-        
+
+    private func accept(_ connection: NWConnection) {
         connection.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                print("New connection established")
-                self.receiveMessage(on: connection)
-            case .cancelled:
-                self.connections.removeAll { $0 === connection }
-            case .failed(let error):
-                print("Connection failed: \(error)")
-                self.connections.removeAll { $0 === connection }
-            default:
-                break
-            }
+            if case .failed = state { connection.cancel() }
         }
-        
         connection.start(queue: .main)
+        receive(on: connection, buffer: Data())
     }
-    
-    private func receiveMessage(on connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
-            if let error = error {
-                print("Receive error: \(error)")
+
+    private func receive(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if error != nil {
+                connection.cancel()
                 return
             }
-            
-            if let data = data, !data.isEmpty {
-                self.handleHTTPRequest(data: data, connection: connection)
+            var buffer = buffer
+            if let data { buffer.append(data) }
+
+            if buffer.count > Self.maxRequestBytes {
+                self.sendPlain(connection, status: 413, message: "Payload Too Large")
+                return
             }
-            
-            if !isComplete {
-                self.receiveMessage(on: connection)
+            switch HTTPRequest.parse(buffer) {
+            case .complete(let request):
+                self.route(request, on: connection)
+            case .incomplete where !isComplete:
+                self.receive(on: connection, buffer: buffer)
+            case .incomplete, .invalid:
+                self.sendPlain(connection, status: 400, message: "Bad Request")
             }
         }
     }
-    
-    private func handleHTTPRequest(data: Data, connection: NWConnection) {
-        guard let requestString = String(data: data, encoding: .utf8) else {
-            sendHTTPError(connection: connection, status: 400, message: "Bad Request")
+
+    // MARK: - HTTP routing
+
+    private func route(_ request: HTTPRequest, on connection: NWConnection) {
+        if request.headers["origin"] != nil {
+            log("Rejected \(request.method) \(request.path): Origin header present")
+            sendPlain(connection, status: 403, message: "Forbidden")
             return
         }
-        
-        let lines = requestString.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else {
-            sendHTTPError(connection: connection, status: 400, message: "Bad Request")
+        if let host = request.headers["host"], !isLoopbackHost(host) {
+            log("Rejected \(request.method) \(request.path): Host \(host)")
+            sendPlain(connection, status: 403, message: "Forbidden")
             return
         }
-        
-        let components = requestLine.components(separatedBy: " ")
-        guard components.count >= 2 else {
-            sendHTTPError(connection: connection, status: 400, message: "Bad Request")
-            return
-        }
-        
-        let method = components[0]
-        let path = components[1]
-        
-        print("📥 [HTTP] \(method) \(path)")
-        
-        switch (method, path) {
-        case ("GET", "/events"):
-            handleSSEConnection(connection: connection)
+
+        switch (request.method, request.path) {
         case ("POST", "/mcp"):
-            handleMCPRequest(data: data, connection: connection)
+            handleJSONRPC(request.body, on: connection)
         case ("GET", "/mcp"):
-            handleMCPDiscovery(connection: connection)
-        case ("POST", "/mcp/initialize"):
-            handleMCPInitialize(data: data, connection: connection)
-        case ("POST", "/mcp/tools/list"):
-            handleMCPToolsList(data: data, connection: connection)
-        case ("POST", "/mcp/tools/call"):
-            handleMCPToolsCall(data: data, connection: connection)
-        case ("GET", "/"):
-            sendHTTPResponse(connection: connection, body: getWelcomeHTML())
+            // No server-initiated SSE stream; the spec allows 405 here.
+            sendPlain(connection, status: 405, message: "Method Not Allowed", extraHeaders: ["Allow": "POST"])
+        case ("DELETE", "/mcp"):
+            sendPlain(connection, status: 405, message: "Method Not Allowed", extraHeaders: ["Allow": "POST"])
+        case ("GET", "/"), ("GET", "/health"):
+            sendJSON(connection, status: 200, object: healthObject())
         default:
-            print("❌ [HTTP] 404 for \(method) \(path)")
-            sendHTTPError(connection: connection, status: 404, message: "Not Found")
+            sendPlain(connection, status: 404, message: "Not Found")
         }
     }
-    
-    private func handleSSEConnection(connection: NWConnection) {
-        let headers = """
-            HTTP/1.1 200 OK\r
-            Content-Type: text/event-stream\r
-            Cache-Control: no-cache\r
-            Connection: keep-alive\r
-            Access-Control-Allow-Origin: *\r
-            \r
-            
-            """
-        
-        connection.send(content: headers.data(using: .utf8), completion: .contentProcessed { error in
-            if let error = error {
-                print("Failed to send SSE headers: \(error)")
+
+    private func isLoopbackHost(_ hostHeader: String) -> Bool {
+        var host = hostHeader.lowercased()
+        if host.hasPrefix("[") {
+            host = String(host.dropFirst().prefix { $0 != "]" })
+        } else if let colon = host.lastIndex(of: ":") {
+            host = String(host[..<colon])
+        }
+        return ["127.0.0.1", "localhost", "::1"].contains(host)
+    }
+
+    private func healthObject() -> [String: Any] {
+        [
+            "status": homesLoaded ? "ok" : "starting",
+            "server": Self.serverName,
+            "version": Self.serverVersion,
+            "authorization": describe(homeManager.authorizationStatus),
+            "homes": homeManager.homes.map { ["name": $0.name, "accessories": $0.accessories.count, "rooms": $0.rooms.count] }
+        ]
+    }
+
+    // MARK: - JSON-RPC
+
+    private func handleJSONRPC(_ body: Data, on connection: NWConnection) {
+        guard let object = try? JSONSerialization.jsonObject(with: body) else {
+            sendJSON(connection, status: 400, object: rpcError(id: NSNull(), code: -32700, message: "Parse error"))
+            return
+        }
+        // Batches are not used by current MCP clients; reject them explicitly.
+        guard let message = object as? [String: Any], let method = message["method"] as? String else {
+            sendJSON(connection, status: 400, object: rpcError(id: NSNull(), code: -32600, message: "Invalid Request"))
+            return
+        }
+        let params = message["params"] as? [String: Any] ?? [:]
+
+        guard let id = message["id"], !(id is NSNull) else {
+            // Notification (e.g. notifications/initialized): acknowledge without a body.
+            sendEmpty(connection, status: 202)
+            return
+        }
+
+        let reply: (Result<[String: Any], RPCFailure>) -> Void = { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let value):
+                self.sendJSON(connection, status: 200, object: ["jsonrpc": "2.0", "id": id, "result": value])
+            case .failure(let failure):
+                self.sendJSON(connection, status: 200, object: self.rpcError(id: id, code: failure.code, message: failure.message))
+            }
+        }
+
+        switch method {
+        case "initialize":
+            let requested = params["protocolVersion"] as? String
+            let version = requested.flatMap { Self.supportedProtocolVersions.contains($0) ? $0 : nil }
+                ?? Self.supportedProtocolVersions[0]
+            reply(.success([
+                "protocolVersion": version,
+                "capabilities": ["tools": ["listChanged": false]],
+                "serverInfo": ["name": Self.serverName, "version": Self.serverVersion],
+                "instructions": Self.instructions
+            ]))
+        case "ping":
+            reply(.success([:]))
+        case "tools/list":
+            reply(.success(["tools": ToolCatalog.tools]))
+        case "tools/call":
+            guard let name = params["name"] as? String else {
+                reply(.failure(RPCFailure(code: -32602, message: "Missing tool name")))
                 return
             }
-            
-            // Send initial server info
-            self.sendSSEEvent(connection: connection, event: "server-info", data: [
-                "name": "homekit-mcp-server",
-                "version": "1.0.0",
-                "tools": ["get_all_accessories", "get_all_rooms", "set_accessory_room"]
-            ])
-        })
-    }
-    
-    private func handleMCPDiscovery(connection: NWConnection) {
-        let discovery: [String: Any] = [
-            "version": "2024-11-05",
-            "capabilities": [
-                "tools": [:]
-            ],
-            "serverInfo": [
-                "name": "homekit-mcp-server",
-                "version": "1.0.0"
-            ]
-        ]
-        
-        do {
-            let responseData = try JSONSerialization.data(withJSONObject: discovery)
-            sendHTTPResponse(connection: connection, body: responseData)
-        } catch {
-            sendHTTPError(connection: connection, status: 500, message: "Internal Server Error")
-        }
-    }
-    
-    private func handleMCPInitialize(data: Data, connection: NWConnection) {
-        guard let jsonData = extractJSONFromHTTP(data: data) else {
-            sendHTTPError(connection: connection, status: 400, message: "Invalid request")
-            return
-        }
-        
-        do {
-            let request = try JSONDecoder().decode(MCPRequest.self, from: jsonData)
-            let response = handleInitialize(request)
-            let responseData = try encoder.encode(response)
-            sendHTTPResponse(connection: connection, body: responseData)
-        } catch {
-            sendHTTPError(connection: connection, status: 400, message: "Invalid MCP request")
-        }
-    }
-    
-    private func handleMCPToolsList(data: Data, connection: NWConnection) {
-        guard let jsonData = extractJSONFromHTTP(data: data) else {
-            sendHTTPError(connection: connection, status: 400, message: "Invalid request")
-            return
-        }
-        
-        do {
-            let request = try JSONDecoder().decode(MCPRequest.self, from: jsonData)
-            let response = handleToolsList(request)
-            let responseData = try encoder.encode(response)
-            sendHTTPResponse(connection: connection, body: responseData)
-        } catch {
-            sendHTTPError(connection: connection, status: 400, message: "Invalid MCP request")
-        }
-    }
-    
-    private func handleMCPToolsCall(data: Data, connection: NWConnection) {
-        print("🔧 [MCP] Tool call received")
-        
-        guard let jsonData = extractJSONFromHTTP(data: data) else {
-            print("❌ [MCP] Failed to extract JSON from HTTP request")
-            sendHTTPError(connection: connection, status: 400, message: "Invalid request")
-            return
-        }
-        
-        do {
-            let request = try JSONDecoder().decode(MCPRequest.self, from: jsonData)
-            print("🔧 [MCP] Decoded request ID: \(request.id ?? -1)")
-            
-            let response = handleToolCall(request)
-            print("📤 [MCP] Generated response for ID: \(response.id ?? -1)")
-            
-            let responseData = try encoder.encode(response)
-            print("✅ [MCP] Sending response (\(responseData.count) bytes)")
-            sendHTTPResponse(connection: connection, body: responseData)
-        } catch {
-            print("❌ [MCP] Error processing tool call: \(error)")
-            let errorResponse = MCPResponse(
-                jsonrpc: "2.0", 
-                id: nil, 
-                result: nil, 
-                error: MCPError(code: -32603, message: "Internal error: \(error.localizedDescription)")
-            )
-            
-            do {
-                let errorData = try encoder.encode(errorResponse)
-                sendHTTPResponse(connection: connection, body: errorData)
-            } catch {
-                sendHTTPError(connection: connection, status: 500, message: "Internal Server Error")
-            }
-        }
-    }
-    
-    private func handleMCPRequest(data: Data, connection: NWConnection) {
-        guard let jsonData = extractJSONFromHTTP(data: data) else {
-            sendHTTPError(connection: connection, status: 400, message: "Invalid request")
-            return
-        }
-        
-        do {
-            let request = try JSONDecoder().decode(MCPRequest.self, from: jsonData)
-            let response = processMCPRequest(request)
-            let responseData = try encoder.encode(response)
-            
-            sendHTTPResponse(connection: connection, body: responseData)
-        } catch {
-            sendHTTPError(connection: connection, status: 400, message: "Invalid MCP request: \(error)")
-        }
-    }
-    
-    private func extractJSONFromHTTP(data: Data) -> Data? {
-        guard let requestString = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        
-        let lines = requestString.components(separatedBy: "\r\n")
-        guard let bodyStartIndex = lines.firstIndex(of: ""),
-              bodyStartIndex + 1 < lines.count else {
-            return nil
-        }
-        
-        let bodyLines = Array(lines[(bodyStartIndex + 1)...])
-        let jsonBody = bodyLines.joined(separator: "\r\n")
-        
-        return jsonBody.data(using: .utf8)
-    }
-    
-    private func processMCPRequest(_ request: MCPRequest) -> MCPResponse {
-        switch request.method {
-        case "tools/list":
-            return handleToolsList(request)
-        case "tools/call":
-            return handleToolCall(request)
-        case "initialize":
-            return handleInitialize(request)
-        default:
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil, 
-                              error: MCPError(code: -32601, message: "Method not found"))
-        }
-    }
-    
-    private func handleInitialize(_ request: MCPRequest) -> MCPResponse {
-        let result: [String: Any] = [
-            "protocolVersion": "2024-11-05",
-            "capabilities": [
-                "tools": [:]
-            ],
-            "serverInfo": [
-                "name": "homekit-mcp-server",
-                "version": "1.0.0"
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: [
-                            "protocolVersion": AnyEncodable("2024-11-05"),
-                            "capabilities": AnyEncodable(["tools": [:]]),
-                            "serverInfo": AnyEncodable([
-                                "name": "homekit-mcp-server",
-                                "version": "1.0.0"
-                            ])
-                          ], error: nil)
-    }
-    
-    private func handleToolsList(_ request: MCPRequest) -> MCPResponse {
-        let tools: [[String: Any]] = [
-            [
-                "name": "get_all_accessories",
-                "description": "Get all HomeKit accessories with their names, rooms, and UUIDs",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [:],
-                    "required": []
-                ]
-            ],
-            [
-                "name": "get_all_rooms",
-                "description": "Get all HomeKit rooms with their names and UUIDs",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [:],
-                    "required": []
-                ]
-            ],
-            [
-                "name": "set_accessory_room",
-                "description": "Move an accessory to a different room using UUIDs",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "accessory_uuid": [
-                            "type": "string",
-                            "description": "UUID of the accessory to move"
-                        ],
-                        "room_uuid": [
-                            "type": "string",
-                            "description": "UUID of the target room"
-                        ]
-                    ],
-                    "required": ["accessory_uuid", "room_uuid"]
-                ]
-            ],
-            [
-                "name": "get_accessory_by_name",
-                "description": "Find a HomeKit accessory by name",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "name": [
-                            "type": "string",
-                            "description": "Name or partial name of the accessory to find"
-                        ]
-                    ],
-                    "required": ["name"]
-                ]
-            ],
-            [
-                "name": "get_room_by_name",
-                "description": "Find a HomeKit room by name",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "name": [
-                            "type": "string",
-                            "description": "Name or partial name of the room to find"
-                        ]
-                    ],
-                    "required": ["name"]
-                ]
-            ],
-            [
-                "name": "set_accessory_room_by_name",
-                "description": "Move an accessory to a different room using names",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "accessory_name": [
-                            "type": "string",
-                            "description": "Name of the accessory to move"
-                        ],
-                        "room_name": [
-                            "type": "string",
-                            "description": "Name of the target room"
-                        ]
-                    ],
-                    "required": ["accessory_name", "room_name"]
-                ]
-            ],
-            [
-                "name": "rename_accessory",
-                "description": "Rename a HomeKit accessory",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "accessory_name": [
-                            "type": "string",
-                            "description": "Current name of the accessory to rename"
-                        ],
-                        "new_name": [
-                            "type": "string",
-                            "description": "New name for the accessory"
-                        ]
-                    ],
-                    "required": ["accessory_name", "new_name"]
-                ]
-            ],
-            [
-                "name": "rename_room",
-                "description": "Rename a HomeKit room",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "room_name": [
-                            "type": "string",
-                            "description": "Current name of the room to rename"
-                        ],
-                        "new_name": [
-                            "type": "string",
-                            "description": "New name for the room"
-                        ]
-                    ],
-                    "required": ["room_name", "new_name"]
-                ]
-            ],
-            [
-                "name": "get_room_accessories",
-                "description": "Get all accessories in a specific room",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "room_name": [
-                            "type": "string",
-                            "description": "Name of the room to get accessories from"
-                        ]
-                    ],
-                    "required": ["room_name"]
-                ]
-            ],
-            [
-                "name": "accessory_on",
-                "description": "Turn on an accessory (lights, switches) or open covers",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "accessory_name": [
-                            "type": "string",
-                            "description": "Name of the accessory to turn on"
-                        ]
-                    ],
-                    "required": ["accessory_name"]
-                ]
-            ],
-            [
-                "name": "accessory_off",
-                "description": "Turn off an accessory (lights, switches) or close covers",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "accessory_name": [
-                            "type": "string",
-                            "description": "Name of the accessory to turn off"
-                        ]
-                    ],
-                    "required": ["accessory_name"]
-                ]
-            ],
-            [
-                "name": "accessory_toggle",
-                "description": "Toggle an accessory (lights, switches, covers) between on/off or open/close",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "accessory_name": [
-                            "type": "string",
-                            "description": "Name of the accessory to toggle"
-                        ]
-                    ],
-                    "required": ["accessory_name"]
-                ]
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: ["tools": AnyEncodable(tools)], error: nil)
-    }
-    
-    private func handleToolCall(_ request: MCPRequest) -> MCPResponse {
-        guard let params = request.params,
-              let toolName = params["name"]?.value as? String,
-              let arguments = params["arguments"]?.value as? [String: Any] else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Invalid params"))
-        }
-        
-        switch toolName {
-        case "get_all_accessories":
-            return handleGetAllAccessories(request)
-        case "get_all_rooms":
-            return handleGetAllRooms(request)
-        case "set_accessory_room":
-            return handleSetAccessoryRoom(request, arguments: arguments)
-        case "get_accessory_by_name":
-            return handleGetAccessoryByName(request, arguments: arguments)
-        case "get_room_by_name":
-            return handleGetRoomByName(request, arguments: arguments)
-        case "set_accessory_room_by_name":
-            return handleSetAccessoryRoomByName(request, arguments: arguments)
-        case "rename_accessory":
-            return handleRenameAccessory(request, arguments: arguments)
-        case "rename_room":
-            return handleRenameRoom(request, arguments: arguments)
-        case "get_room_accessories":
-            return handleGetRoomAccessories(request, arguments: arguments)
-        case "accessory_on":
-            return handleAccessoryOn(request, arguments: arguments)
-        case "accessory_off":
-            return handleAccessoryOff(request, arguments: arguments)
-        case "accessory_toggle":
-            return handleAccessoryToggle(request, arguments: arguments)
-        default:
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32601, message: "Tool not found"))
-        }
-    }
-    
-    private func handleGetAllAccessories(_ request: MCPRequest) -> MCPResponse {
-        var accessories: [[String: Any]] = []
-        
-        for home in homeManager.homes {
-            for accessory in home.accessories {
-                let categoryName = getCategoryName(for: accessory.category)
-                accessories.append([
-                    "name": accessory.name,
-                    "room": accessory.room?.name ?? "No Room",
-                    "uuid": accessory.uniqueIdentifier.uuidString,
-                    "home": home.name,
-                    "category": categoryName,
-                    "reachable": accessory.isReachable,
-                    "firmware": getAccessoryFirmware(accessory),
-                    "serial_number": getAccessorySerialNumber(accessory)
-                ])
-            }
-        }
-        
-        let content = [
-            [
-                "type": "text",
-                "text": "Found \(accessories.count) accessories:\n" + 
-                       accessories.map { acc in
-                           let name = acc["name"] as! String
-                           let category = acc["category"] as! String
-                           let room = acc["room"] as! String
-                           let uuid = acc["uuid"] as! String
-                           let firmware = acc["firmware"] as! String
-                           let serialNumber = acc["serial_number"] as! String
-                           return "• \(name) (\(category)) - Room: \(room), UUID: \(uuid), FW: \(firmware), S/N: \(serialNumber)"
-                       }.joined(separator: "\n")
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: [
-                            "content": AnyEncodable(content),
-                            "_meta": AnyEncodable(["accessories": accessories])
-                          ], error: nil)
-    }
-    
-    private func getCategoryName(for category: HMAccessoryCategory) -> String {
-        // Use the localized description from HomeKit which gives us human-readable names
-        return category.localizedDescription
-    }
-    
-    private func getAccessoryFirmware(_ accessory: HMAccessory) -> String {
-        // Look for firmware version in accessory information service
-        for service in accessory.services {
-            if service.serviceType == HMServiceTypeAccessoryInformation {
-                for characteristic in service.characteristics {
-                    if characteristic.characteristicType == HMCharacteristicTypeFirmwareVersion {
-                        return characteristic.value as? String ?? "Unknown"
-                    }
-                }
-            }
-        }
-        return "Unknown"
-    }
-    
-    private func getAccessorySerialNumber(_ accessory: HMAccessory) -> String {
-        // Look for serial number in accessory information service
-        for service in accessory.services {
-            if service.serviceType == HMServiceTypeAccessoryInformation {
-                for characteristic in service.characteristics {
-                    if characteristic.characteristicType == HMCharacteristicTypeSerialNumber {
-                        return characteristic.value as? String ?? "Unknown"
-                    }
-                }
-            }
-        }
-        return "Unknown"
-    }
-    
-    private func handleGetAllRooms(_ request: MCPRequest) -> MCPResponse {
-        var rooms: [[String: Any]] = []
-        
-        for home in homeManager.homes {
-            for room in home.rooms {
-                rooms.append([
-                    "name": room.name,
-                    "uuid": room.uniqueIdentifier.uuidString,
-                    "home": home.name
-                ])
-            }
-        }
-        
-        let content = [
-            [
-                "type": "text",
-                "text": "Found \(rooms.count) rooms:\n" + 
-                       rooms.map { room in
-                           "• \(room["name"] as! String) (UUID: \(room["uuid"] as! String))"
-                       }.joined(separator: "\n")
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: [
-                            "content": AnyEncodable(content),
-                            "_meta": AnyEncodable(["rooms": rooms])
-                          ], error: nil)
-    }
-    
-    private func handleSetAccessoryRoom(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        print("🔧 [MCP] set_accessory_room called with arguments: \(arguments)")
-        
-        guard let accessoryUUIDString = arguments["accessory_uuid"] as? String,
-              let roomUUIDString = arguments["room_uuid"] as? String,
-              let accessoryUUID = UUID(uuidString: accessoryUUIDString),
-              let roomUUID = UUID(uuidString: roomUUIDString) else {
-            print("❌ [MCP] Invalid UUIDs provided")
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Invalid UUIDs"))
-        }
-        
-        print("🔍 [MCP] Looking for accessory: \(accessoryUUIDString)")
-        print("🔍 [MCP] Looking for room: \(roomUUIDString)")
-        
-        var foundAccessory: HMAccessory?
-        var foundRoom: HMRoom?
-        var foundHome: HMHome?
-        
-        for home in homeManager.homes {
-            print("🏠 [MCP] Searching in home: \(home.name)")
-            if foundAccessory == nil {
-                foundAccessory = home.accessories.first { $0.uniqueIdentifier == accessoryUUID }
-                if foundAccessory != nil {
-                    foundHome = home
-                    print("✅ [MCP] Found accessory: \(foundAccessory?.name ?? "unknown") in home: \(home.name)")
-                }
-            }
-            if foundRoom == nil {
-                foundRoom = home.rooms.first { $0.uniqueIdentifier == roomUUID }
-                if foundRoom != nil {
-                    print("✅ [MCP] Found room: \(foundRoom?.name ?? "unknown") in home: \(home.name)")
-                }
-            }
-        }
-        
-        guard let accessory = foundAccessory,
-              let room = foundRoom,
-              let home = foundHome else {
-            print("❌ [MCP] Could not find accessory or room")
-            print("❌ [MCP] Accessory found: \(foundAccessory?.name ?? "nil")")
-            print("❌ [MCP] Room found: \(foundRoom?.name ?? "nil")")
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Accessory or room not found"))
-        }
-        
-        print("🔄 [MCP] Moving \(accessory.name) from \(accessory.room?.name ?? "unknown") to \(room.name)")
-        
-        // Check if accessory is already in target room
-        if accessory.room?.uniqueIdentifier == room.uniqueIdentifier {
-            let moveResult = "ℹ️ \(accessory.name) is already in \(room.name)"
-            print("ℹ️ [MCP] Accessory already in target room")
-            
-            let content = [["type": "text", "text": moveResult]]
-            return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                              result: ["content": AnyEncodable(content)], error: nil)
-        }
-        
-        // Use async approach with shorter timeout
-        let moveResult: String
-        let group = DispatchGroup()
-        var asyncResult: String = ""
-        var operationCompleted = false
-        
-        print("🔄 [MCP] Starting HomeKit operation...")
-        group.enter()
-        
-        home.assignAccessory(accessory, to: room) { error in
-            defer { 
-                if !operationCompleted {
-                    operationCompleted = true
-                    group.leave() 
-                }
-            }
-            
-            if let error = error {
-                asyncResult = "❌ Failed to move \(accessory.name) to \(room.name): \(error.localizedDescription)"
-                print("❌ [MCP] HomeKit error: \(error.localizedDescription)")
-            } else {
-                asyncResult = "✅ Successfully moved \(accessory.name) to \(room.name)"
-                print("✅ [MCP] Move successful")
-            }
-        }
-        
-        // Wait with shorter timeout to prevent hanging Claude Code
-        let result = group.wait(timeout: .now() + 5.0)
-        if result == .timedOut {
-            moveResult = "⏰ Operation timed out after 5 seconds - HomeKit may be busy. Try again later."
-            print("⏰ [MCP] Operation timed out after 5 seconds")
-            if !operationCompleted {
-                operationCompleted = true
-                // Don't call group.leave() here as we already timed out
-            }
-        } else {
-            moveResult = asyncResult
-        }
-        
-        let content = [
-            [
-                "type": "text",
-                "text": moveResult
-            ]
-        ]
-        
-        print("📤 [MCP] Returning result: \(moveResult)")
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: ["content": AnyEncodable(content)], error: nil)
-    }
-    
-    private func handleGetAccessoryByName(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let name = arguments["name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'name' parameter"))
-        }
-        
-        var foundAccessories: [[String: Any]] = []
-        
-        for home in homeManager.homes {
-            for accessory in home.accessories where accessory.name.lowercased().contains(name.lowercased()) {
-                let categoryName = getCategoryName(for: accessory.category)
-                foundAccessories.append([
-                    "name": accessory.name,
-                    "room": accessory.room?.name ?? "No Room",
-                    "uuid": accessory.uniqueIdentifier.uuidString,
-                    "home": home.name,
-                    "category": categoryName,
-                    "reachable": accessory.isReachable
-                ])
-            }
-        }
-        
-        let content = [
-            [
-                "type": "text",
-                "text": foundAccessories.isEmpty 
-                    ? "No accessories found matching '\(name)'"
-                    : "Found \(foundAccessories.count) accessories matching '\(name)':\n" + 
-                      foundAccessories.map { acc in
-                          let name = acc["name"] as! String
-                          let category = acc["category"] as! String
-                          let room = acc["room"] as! String
-                          let uuid = acc["uuid"] as! String
-                          return "• \(name) (\(category)) - Room: \(room), UUID: \(uuid)"
-                      }.joined(separator: "\n")
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: [
-                            "content": AnyEncodable(content),
-                            "_meta": AnyEncodable(["accessories": foundAccessories])
-                          ], error: nil)
-    }
-    
-    private func handleGetRoomByName(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let name = arguments["name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'name' parameter"))
-        }
-        
-        var foundRooms: [[String: Any]] = []
-        
-        for home in homeManager.homes {
-            for room in home.rooms where room.name.lowercased().contains(name.lowercased()) {
-                foundRooms.append([
-                    "name": room.name,
-                    "uuid": room.uniqueIdentifier.uuidString,
-                    "home": home.name
-                ])
-            }
-        }
-        
-        let content = [
-            [
-                "type": "text",
-                "text": foundRooms.isEmpty 
-                    ? "No rooms found matching '\(name)'"
-                    : "Found \(foundRooms.count) rooms matching '\(name)':\n" + 
-                      foundRooms.map { room in
-                          "• \(room["name"] as! String) (UUID: \(room["uuid"] as! String))"
-                      }.joined(separator: "\n")
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: [
-                            "content": AnyEncodable(content),
-                            "_meta": AnyEncodable(["rooms": foundRooms])
-                          ], error: nil)
-    }
-    
-    private func handleSetAccessoryRoomByName(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let accessoryName = arguments["accessory_name"] as? String,
-              let roomName = arguments["room_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'accessory_name' or 'room_name' parameter"))
-        }
-        
-        // Find accessory by name
-        var foundAccessory: HMAccessory?
-        var foundHome: HMHome?
-        
-        for home in homeManager.homes {
-            if let accessory = home.accessories.first(where: { $0.name.lowercased().contains(accessoryName.lowercased()) }) {
-                foundAccessory = accessory
-                foundHome = home
-                break
-            }
-        }
-        
-        guard let accessory = foundAccessory, let home = foundHome else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Accessory '\(accessoryName)' not found"))
-        }
-        
-        // Find room by name
-        var foundRoom: HMRoom?
-        
-        for homeItem in homeManager.homes {
-            if let room = homeItem.rooms.first(where: { $0.name.lowercased().contains(roomName.lowercased()) }) {
-                foundRoom = room
-                break
-            }
-        }
-        
-        guard let room = foundRoom else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Room '\(roomName)' not found"))
-        }
-        
-        // Check if accessory is already in target room
-        if accessory.room?.uniqueIdentifier == room.uniqueIdentifier {
-            let result = "ℹ️ \(accessory.name) is already in \(room.name)"
-            let content = [["type": "text", "text": result]]
-            return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                              result: ["content": AnyEncodable(content)], error: nil)
-        }
-        
-        // Move the accessory
-        let moveResult: String
-        let group = DispatchGroup()
-        var asyncResult: String = ""
-        var operationCompleted = false
-        
-        group.enter()
-        
-        home.assignAccessory(accessory, to: room) { error in
-            defer { 
-                if !operationCompleted {
-                    operationCompleted = true
-                    group.leave() 
-                }
-            }
-            
-            if let error = error {
-                asyncResult = "❌ Failed to move \(accessory.name) to \(room.name): \(error.localizedDescription)"
-            } else {
-                asyncResult = "✅ Successfully moved \(accessory.name) to \(room.name)"
-            }
-        }
-        
-        let result = group.wait(timeout: .now() + 5.0)
-        if result == .timedOut {
-            moveResult = "⏰ Operation timed out after 5 seconds - HomeKit may be busy. Try again later."
-            if !operationCompleted {
-                operationCompleted = true
-            }
-        } else {
-            moveResult = asyncResult
-        }
-        
-        let content = [["type": "text", "text": moveResult]]
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: ["content": AnyEncodable(content)], error: nil)
-    }
-    
-    private func handleRenameAccessory(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let accessoryName = arguments["accessory_name"] as? String,
-              let newName = arguments["new_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'accessory_name' or 'new_name' parameter"))
-        }
-        
-        // Find accessory by name
-        var foundAccessory: HMAccessory?
-        
-        for home in homeManager.homes {
-            if let accessory = home.accessories.first(where: { $0.name.lowercased().contains(accessoryName.lowercased()) }) {
-                foundAccessory = accessory
-                break
-            }
-        }
-        
-        guard let accessory = foundAccessory else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Accessory '\(accessoryName)' not found"))
-        }
-        
-        // Rename the accessory
-        let renameResult: String
-        let group = DispatchGroup()
-        var asyncResult: String = ""
-        var operationCompleted = false
-        
-        group.enter()
-        
-        accessory.updateName(newName) { error in
-            defer { 
-                if !operationCompleted {
-                    operationCompleted = true
-                    group.leave() 
-                }
-            }
-            
-            if let error = error {
-                asyncResult = "❌ Failed to rename '\(accessory.name)' to '\(newName)': \(error.localizedDescription)"
-            } else {
-                asyncResult = "✅ Successfully renamed '\(accessoryName)' to '\(newName)'"
-            }
-        }
-        
-        let result = group.wait(timeout: .now() + 5.0)
-        if result == .timedOut {
-            renameResult = "⏰ Operation timed out after 5 seconds - HomeKit may be busy. Try again later."
-            if !operationCompleted {
-                operationCompleted = true
-            }
-        } else {
-            renameResult = asyncResult
-        }
-        
-        let content = [["type": "text", "text": renameResult]]
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: ["content": AnyEncodable(content)], error: nil)
-    }
-    
-    private func handleRenameRoom(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let roomName = arguments["room_name"] as? String,
-              let newName = arguments["new_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'room_name' or 'new_name' parameter"))
-        }
-        
-        // Find room by name
-        var foundRoom: HMRoom?
-        
-        for home in homeManager.homes {
-            if let room = home.rooms.first(where: { $0.name.lowercased().contains(roomName.lowercased()) }) {
-                foundRoom = room
-                break
-            }
-        }
-        
-        guard let room = foundRoom else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Room '\(roomName)' not found"))
-        }
-        
-        // Rename the room
-        let renameResult: String
-        let group = DispatchGroup()
-        var asyncResult: String = ""
-        var operationCompleted = false
-        
-        group.enter()
-        
-        room.updateName(newName) { error in
-            defer { 
-                if !operationCompleted {
-                    operationCompleted = true
-                    group.leave() 
-                }
-            }
-            
-            if let error = error {
-                asyncResult = "❌ Failed to rename '\(room.name)' to '\(newName)': \(error.localizedDescription)"
-            } else {
-                asyncResult = "✅ Successfully renamed '\(roomName)' to '\(newName)'"
-            }
-        }
-        
-        let result = group.wait(timeout: .now() + 5.0)
-        if result == .timedOut {
-            renameResult = "⏰ Operation timed out after 5 seconds - HomeKit may be busy. Try again later."
-            if !operationCompleted {
-                operationCompleted = true
-            }
-        } else {
-            renameResult = asyncResult
-        }
-        
-        let content = [["type": "text", "text": renameResult]]
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: ["content": AnyEncodable(content)], error: nil)
-    }
-    
-    private func handleGetRoomAccessories(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let roomName = arguments["room_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'room_name' parameter"))
-        }
-        
-        // Find room by name
-        var foundRoom: HMRoom?
-        var foundHome: HMHome?
-        
-        for home in homeManager.homes {
-            if let room = home.rooms.first(where: { $0.name.lowercased().contains(roomName.lowercased()) }) {
-                foundRoom = room
-                foundHome = home
-                break
-            }
-        }
-        
-        guard let room = foundRoom, let home = foundHome else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Room '\(roomName)' not found"))
-        }
-        
-        // Get accessories in this room
-        var roomAccessories: [[String: Any]] = []
-        
-        for accessory in home.accessories where accessory.room?.uniqueIdentifier == room.uniqueIdentifier {
-            let categoryName = getCategoryName(for: accessory.category)
-            roomAccessories.append([
-                "name": accessory.name,
-                "uuid": accessory.uniqueIdentifier.uuidString,
-                "category": categoryName,
-                "reachable": accessory.isReachable,
-                "firmware": getAccessoryFirmware(accessory),
-                "serial_number": getAccessorySerialNumber(accessory)
-            ])
-        }
-        
-        let content = [
-            [
-                "type": "text",
-                "text": roomAccessories.isEmpty 
-                    ? "No accessories found in room '\(room.name)'"
-                    : "Found \(roomAccessories.count) accessories in '\(room.name)':\n" + 
-                      roomAccessories.map { acc in
-                          let name = acc["name"] as! String
-                          let category = acc["category"] as! String
-                          let uuid = acc["uuid"] as! String
-                          let reachable = acc["reachable"] as! Bool
-                          let firmware = acc["firmware"] as! String
-                          let serialNumber = acc["serial_number"] as! String
-                          let status = reachable ? "🟢" : "🔴"
-                          return "• \(name) (\(category)) \(status) - UUID: \(uuid), FW: \(firmware), S/N: \(serialNumber)"
-                      }.joined(separator: "\n")
-            ]
-        ]
-        
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: [
-                            "content": AnyEncodable(content),
-                            "_meta": AnyEncodable([
-                                "room": ["name": room.name, "uuid": room.uniqueIdentifier.uuidString],
-                                "accessories": roomAccessories
-                            ])
-                          ], error: nil)
-    }
-    
-    private func handleAccessoryOn(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let accessoryName = arguments["accessory_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'accessory_name' parameter"))
-        }
-        
-        return controlAccessory(request: request, accessoryName: accessoryName, action: .turnOn)
-    }
-    
-    private func handleAccessoryOff(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let accessoryName = arguments["accessory_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'accessory_name' parameter"))
-        }
-        
-        return controlAccessory(request: request, accessoryName: accessoryName, action: .turnOff)
-    }
-    
-    private func handleAccessoryToggle(_ request: MCPRequest, arguments: [String: Any]) -> MCPResponse {
-        guard let accessoryName = arguments["accessory_name"] as? String else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32602, message: "Missing 'accessory_name' parameter"))
-        }
-        
-        return controlAccessory(request: request, accessoryName: accessoryName, action: .toggle)
-    }
-    
-    private enum AccessoryAction {
-        case turnOn, turnOff, toggle
-    }
-    
-    private func controlAccessory(request: MCPRequest, accessoryName: String, action: AccessoryAction) -> MCPResponse {
-        // Find accessory by name
-        var foundAccessory: HMAccessory?
-        
-        for home in homeManager.homes {
-            if let accessory = home.accessories.first(where: { $0.name.lowercased().contains(accessoryName.lowercased()) }) {
-                foundAccessory = accessory
-                break
-            }
-        }
-        
-        guard let accessory = foundAccessory else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Accessory '\(accessoryName)' not found"))
-        }
-        
-        // Find controllable characteristics
-        var controllableCharacteristics: [HMCharacteristic] = []
-        var characteristicType: String = ""
-        
-        for service in accessory.services {
-            // Look for power state characteristic (lights, switches)
-            if let powerChar = service.characteristics.first(where: { 
-                $0.characteristicType == HMCharacteristicTypePowerState 
-            }) {
-                controllableCharacteristics.append(powerChar)
-                characteristicType = "power"
-                break
-            }
-            
-            // Look for brightness characteristic (lights) - indicates dimmable light
-            if let brightnessChar = service.characteristics.first(where: { 
-                $0.characteristicType == HMCharacteristicTypeBrightness 
-            }) {
-                // For dimmable lights, use power state for on/off control
-                if let powerChar = service.characteristics.first(where: { 
-                    $0.characteristicType == HMCharacteristicTypePowerState 
-                }) {
-                    controllableCharacteristics.append(powerChar)
-                    characteristicType = "power"
-                    break
-                }
-            }
-            
-            // Look for target position characteristic (covers, blinds)
-            if let positionChar = service.characteristics.first(where: { 
-                $0.characteristicType == HMCharacteristicTypeTargetPosition 
-            }) {
-                controllableCharacteristics.append(positionChar)
-                characteristicType = "position"
-                break
-            }
-            
-            // Look for target door state (garage doors)
-            if let doorChar = service.characteristics.first(where: { 
-                $0.characteristicType == HMCharacteristicTypeTargetDoorState 
-            }) {
-                controllableCharacteristics.append(doorChar)
-                characteristicType = "door"
-                break
-            }
-        }
-        
-        guard !controllableCharacteristics.isEmpty else {
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Accessory '\(accessory.name)' has no controllable characteristics"))
-        }
-        
-        let characteristic = controllableCharacteristics[0]
-        
-        // Determine target value based on action and characteristic type
-        var targetValue: Any
-        var actionDescription: String
-        
-        switch (action, characteristicType) {
-        case (.turnOn, "power"):
-            targetValue = true
-            actionDescription = "turn on"
-        case (.turnOff, "power"):
-            targetValue = false
-            actionDescription = "turn off"
-        case (.turnOn, "position"):
-            targetValue = 100 // Fully open
-            actionDescription = "open"
-        case (.turnOff, "position"):
-            targetValue = 0 // Fully closed
-            actionDescription = "close"
-        case (.turnOn, "door"):
-            targetValue = HMCharacteristicValueDoorState.open.rawValue
-            actionDescription = "open"
-        case (.turnOff, "door"):
-            targetValue = HMCharacteristicValueDoorState.closed.rawValue
-            actionDescription = "close"
-        case (.toggle, _):
-            // For toggle, we need to read current state first
-            guard let currentValue = characteristic.value else {
-                return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                                  error: MCPError(code: -32603, message: "Cannot read current state of '\(accessory.name)'"))
-            }
-            
-            switch characteristicType {
-            case "power":
-                let currentBool = currentValue as? Bool ?? false
-                targetValue = !currentBool
-                actionDescription = currentBool ? "turn off" : "turn on"
-            case "position":
-                let currentPosition = currentValue as? Int ?? 0
-                targetValue = currentPosition > 50 ? 0 : 100
-                actionDescription = currentPosition > 50 ? "close" : "open"
-            case "door":
-                let currentDoor = currentValue as? Int ?? HMCharacteristicValueDoorState.closed.rawValue
-                targetValue = currentDoor == HMCharacteristicValueDoorState.closed.rawValue ? 
-                    HMCharacteristicValueDoorState.open.rawValue : HMCharacteristicValueDoorState.closed.rawValue
-                actionDescription = currentDoor == HMCharacteristicValueDoorState.closed.rawValue ? "open" : "close"
-            default:
-                return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                                  error: MCPError(code: -32603, message: "Cannot toggle '\(accessory.name)' - unknown characteristic type"))
+            let arguments = params["arguments"] as? [String: Any] ?? [:]
+            callTool(name, arguments: arguments) { outcome in
+                reply(.success(outcome.mcpResult))
             }
         default:
-            return MCPResponse(jsonrpc: "2.0", id: request.id, result: nil,
-                              error: MCPError(code: -32603, message: "Invalid action for '\(accessory.name)' - unsupported characteristic type"))
-        }
-        
-        // Execute the control action
-        let controlResult: String
-        let group = DispatchGroup()
-        var asyncResult: String = ""
-        var operationCompleted = false
-        
-        group.enter()
-        
-        characteristic.writeValue(targetValue) { error in
-            defer { 
-                if !operationCompleted {
-                    operationCompleted = true
-                    group.leave() 
-                }
-            }
-            
-            if let error = error {
-                asyncResult = "❌ Failed to \(actionDescription) '\(accessory.name)': \(error.localizedDescription)"
-            } else {
-                asyncResult = "✅ Successfully \(actionDescription) '\(accessory.name)'"
-            }
-        }
-        
-        let result = group.wait(timeout: .now() + 5.0)
-        if result == .timedOut {
-            controlResult = "⏰ Operation timed out after 5 seconds - HomeKit may be busy. Try again later."
-            if !operationCompleted {
-                operationCompleted = true
-            }
-        } else {
-            controlResult = asyncResult
-        }
-        
-        let content = [["type": "text", "text": controlResult]]
-        return MCPResponse(jsonrpc: "2.0", id: request.id, 
-                          result: ["content": AnyEncodable(content)], error: nil)
-    }
-    
-    private func sendSSEEvent(connection: NWConnection, event: String, data: [String: Any]) {
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: data)
-            let jsonString = String(data: jsonData, encoding: .utf8) ?? "{}"
-            
-            let sseMessage = "event: \(event)\ndata: \(jsonString)\n\n"
-            
-            connection.send(content: sseMessage.data(using: .utf8), completion: .contentProcessed { error in
-                if let error = error {
-                    print("Failed to send SSE event: \(error)")
-                }
-            })
-        } catch {
-            print("Failed to serialize SSE data: \(error)")
+            reply(.failure(RPCFailure(code: -32601, message: "Method not found: \(method)")))
         }
     }
-    
-    private func sendHTTPResponse(connection: NWConnection, body: Data) {
-        let headers = """
-            HTTP/1.1 200 OK\r
-            Content-Type: application/json\r
-            Content-Length: \(body.count)\r
-            Access-Control-Allow-Origin: *\r
-            \r
-            
-            """
-        
-        var responseData = Data()
-        guard let headerData = headers.data(using: .utf8) else {
-            print("Failed to encode HTTP headers")
-            connection.cancel()
-            return
-        }
-        responseData.append(headerData)
-        responseData.append(body)
-        
-        connection.send(content: responseData, completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+
+    private func rpcError(id: Any, code: Int, message: String) -> [String: Any] {
+        ["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]]
     }
-    
-    private func sendHTTPResponse(connection: NWConnection, body: String) {
-        sendHTTPResponse(connection: connection, body: body.data(using: .utf8) ?? Data())
-    }
-    
-    private func sendHTTPError(connection: NWConnection, status: Int, message: String) {
-        let response = """
-            HTTP/1.1 \(status) \(message)\r
-            Content-Type: text/plain\r
-            Content-Length: \(message.count)\r
-            Access-Control-Allow-Origin: *\r
-            \r
-            \(message)
-            """
-        
-        connection.send(content: response.data(using: .utf8), completion: .contentProcessed { _ in
-            connection.cancel()
-        })
-    }
-    
-    private func getWelcomeHTML() -> String {
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>HomeKit MCP Server</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 40px; }
-                .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
-                code { background: #e8e8e8; padding: 2px 4px; border-radius: 3px; }
-            </style>
-        </head>
-        <body>
-            <h1>HomeKit MCP Server</h1>
-            <p>HTTP-based MCP server for HomeKit integration with Claude Code support</p>
-            
-            <h2>MCP Transport Endpoints (Claude Code):</h2>
-            <div class="endpoint">
-                <strong>GET /mcp</strong> - MCP server discovery
-            </div>
-            <div class="endpoint">
-                <strong>POST /mcp/initialize</strong> - Initialize MCP session
-            </div>
-            <div class="endpoint">
-                <strong>POST /mcp/tools/list</strong> - List available tools
-            </div>
-            <div class="endpoint">
-                <strong>POST /mcp/tools/call</strong> - Execute tool
-            </div>
-            
-            <h2>Direct Endpoints:</h2>
-            <div class="endpoint">
-                <strong>GET /events</strong> - Server-Sent Events stream
-            </div>
-            <div class="endpoint">
-                <strong>POST /mcp</strong> - Direct MCP JSON-RPC requests
-            </div>
-            
-            <h2>Available Tools:</h2>
-            <ul>
-                <li><code>get_all_accessories</code> - List all HomeKit accessories</li>
-                <li><code>get_all_rooms</code> - List all HomeKit rooms</li>
-                <li><code>set_accessory_room</code> - Move accessory to different room</li>
-            </ul>
-            
-            <h2>Claude Code Configuration:</h2>
-            <pre><code>{
-              "mcpServers": {
-                "homekit": {
-                  "type": "http",
-                  "url": "http://localhost:8080/mcp"
-                }
-              }
-            }</code></pre>
-        </body>
-        </html>
+
+    static let instructions = """
+        Apple Home (HomeKit) organisation tools for this household. Use them to read and \
+        fix rooms and names in the Apple Home app; they cannot switch, lock or unlock \
+        anything (use Home Assistant for device control). Accessories bridged from Home \
+        Assistant report their HA entity_id as serial_number, so you can address them by \
+        entity_id. Write tools need an exact match (UUID, serial_number or full name); \
+        call list_accessories / list_rooms first.
         """
+
+    // MARK: - Tools
+
+    private func callTool(_ name: String, arguments: [String: Any], completion: @escaping (ToolOutcome) -> Void) {
+        guard homesLoaded else {
+            completion(.failure("HomeKit has not loaded homes yet (authorization: "
+                + "\(describe(homeManager.authorizationStatus))). Try again in a few seconds."))
+            return
+        }
+        let args = ToolArguments(arguments)
+        do {
+            switch name {
+            case "list_homes":
+                completion(.success(listHomes()))
+            case "list_rooms":
+                completion(.success(try listRooms(home: args.string("home"))))
+            case "list_accessories":
+                completion(.success(try listAccessories(
+                    home: args.string("home"), room: args.string("room"), query: args.string("query"))))
+            case "set_accessory_room":
+                let accessoryKey = try args.required("accessory")
+                let roomKey = try args.required("room")
+                try setAccessoryRoom(accessoryKey, roomKey, home: args.string("home"), completion: completion)
+            case "rename_accessory":
+                let accessoryKey = try args.required("accessory")
+                let newName = try args.requiredName("new_name")
+                try renameAccessory(accessoryKey, to: newName, home: args.string("home"), completion: completion)
+            case "rename_room":
+                let roomKey = try args.required("room")
+                let newName = try args.requiredName("new_name")
+                try renameRoom(roomKey, to: newName, home: args.string("home"), completion: completion)
+            case "add_room":
+                let roomName = try args.requiredName("name")
+                try addRoom(named: roomName, home: args.string("home"), completion: completion)
+            default:
+                completion(.failure("Unknown tool: \(name)"))
+            }
+        } catch let error as ToolError {
+            completion(.failure(error.message))
+        } catch {
+            completion(.failure(error.localizedDescription))
+        }
     }
+
+    private func listHomes() -> Any {
+        homeManager.homes.map { home in
+            [
+                "name": home.name,
+                "uuid": home.uniqueIdentifier.uuidString,
+                "rooms": home.rooms.count,
+                "accessories": home.accessories.count
+            ] as [String: Any]
+        }
+    }
+
+    private func listRooms(home homeKey: String?) throws -> Any {
+        try homes(matching: homeKey).flatMap { home in
+            ([home.roomForEntireHome()] + home.rooms).map { room in
+                [
+                    "home": home.name,
+                    "name": room.name,
+                    "uuid": room.uniqueIdentifier.uuidString,
+                    "default_room": room.uniqueIdentifier == home.roomForEntireHome().uniqueIdentifier,
+                    "accessories": home.accessories.filter { $0.room?.uniqueIdentifier == room.uniqueIdentifier }.count
+                ] as [String: Any]
+            }
+        }
+    }
+
+    private func listAccessories(home homeKey: String?, room roomKey: String?, query: String?) throws -> Any {
+        var result: [[String: Any]] = []
+        for home in try homes(matching: homeKey) {
+            let roomFilter = try roomKey.map { try resolveRoom($0, in: home) }
+            for accessory in home.accessories {
+                if let roomFilter, accessory.room?.uniqueIdentifier != roomFilter.uniqueIdentifier { continue }
+                let serial = serialNumber(of: accessory)
+                if let query, !query.isEmpty {
+                    let needle = query.lowercased()
+                    let haystack = [accessory.name, serial ?? "", accessory.room?.name ?? ""].map { $0.lowercased() }
+                    if !haystack.contains(where: { $0.contains(needle) }) { continue }
+                }
+                result.append(describe(accessory, in: home, serial: serial))
+            }
+        }
+        return result
+    }
+
+    private func setAccessoryRoom(_ accessoryKey: String, _ roomKey: String, home homeKey: String?,
+                                  completion: @escaping (ToolOutcome) -> Void) throws {
+        let (home, accessory) = try resolveAccessory(accessoryKey, home: homeKey)
+        let room = try resolveRoom(roomKey, in: home)
+        let from = accessory.room?.name ?? "(none)"
+        if accessory.room?.uniqueIdentifier == room.uniqueIdentifier {
+            completion(.success(["changed": false, "accessory": accessory.name, "room": room.name]))
+            return
+        }
+        log("WRITE set_accessory_room \(accessory.name) [\(accessory.uniqueIdentifier)]: \(from) -> \(room.name)")
+        perform({ done in home.assignAccessory(accessory, to: room, completionHandler: done) },
+                completion: completion) {
+            ["changed": true, "accessory": accessory.name, "from": from, "to": room.name]
+        }
+    }
+
+    private func renameAccessory(_ accessoryKey: String, to newName: String, home homeKey: String?,
+                                 completion: @escaping (ToolOutcome) -> Void) throws {
+        let (_, accessory) = try resolveAccessory(accessoryKey, home: homeKey)
+        let old = accessory.name
+        if old == newName {
+            completion(.success(["changed": false, "accessory": old]))
+            return
+        }
+        log("WRITE rename_accessory [\(accessory.uniqueIdentifier)]: \(old) -> \(newName)")
+        perform({ done in accessory.updateName(newName, completionHandler: done) }, completion: completion) {
+            ["changed": true, "from": old, "to": newName, "uuid": accessory.uniqueIdentifier.uuidString]
+        }
+    }
+
+    private func renameRoom(_ roomKey: String, to newName: String, home homeKey: String?,
+                            completion: @escaping (ToolOutcome) -> Void) throws {
+        let home = try singleHome(homeKey)
+        let room = try resolveRoom(roomKey, in: home)
+        let old = room.name
+        if old == newName {
+            completion(.success(["changed": false, "room": old]))
+            return
+        }
+        log("WRITE rename_room [\(room.uniqueIdentifier)]: \(old) -> \(newName)")
+        perform({ done in room.updateName(newName, completionHandler: done) }, completion: completion) {
+            ["changed": true, "from": old, "to": newName, "uuid": room.uniqueIdentifier.uuidString]
+        }
+    }
+
+    private func addRoom(named name: String, home homeKey: String?,
+                         completion: @escaping (ToolOutcome) -> Void) throws {
+        let home = try singleHome(homeKey)
+        if let existing = home.rooms.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            completion(.success(["changed": false, "room": existing.name, "uuid": existing.uniqueIdentifier.uuidString]))
+            return
+        }
+        log("WRITE add_room \(name) in \(home.name)")
+        var created: HMRoom?
+        perform({ done in
+            home.addRoom(withName: name) { room, error in
+                created = room
+                done(error)
+            }
+        }, completion: completion) {
+            ["changed": true, "room": name, "uuid": created?.uniqueIdentifier.uuidString ?? ""]
+        }
+    }
+
+    /// Runs a HomeKit write and reports it once, with a timeout so a wedged daemon cannot hang the client.
+    private func perform(_ operation: (@escaping (Error?) -> Void) -> Void,
+                         completion: @escaping (ToolOutcome) -> Void,
+                         success: @escaping () -> Any) {
+        var finished = false
+        let finish: (ToolOutcome) -> Void = { outcome in
+            DispatchQueue.main.async {
+                guard !finished else { return }
+                finished = true
+                completion(outcome)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.writeTimeout) {
+            finish(.failure("HomeKit did not answer within \(Int(Self.writeTimeout)) s; "
+                + "re-read the state before retrying."))
+        }
+        operation { error in
+            if let error {
+                self.log("WRITE failed: \(error.localizedDescription)")
+                finish(.failure(error.localizedDescription))
+            } else {
+                finish(.success(success()))
+            }
+        }
+    }
+
+    // MARK: - Resolution (exact matches only)
+
+    private func homes(matching key: String?) throws -> [HMHome] {
+        guard let key, !key.isEmpty else { return homeManager.homes }
+        return [try resolveHome(key)]
+    }
+
+    private func singleHome(_ key: String?) throws -> HMHome {
+        if let key, !key.isEmpty { return try resolveHome(key) }
+        guard homeManager.homes.count == 1, let home = homeManager.homes.first else {
+            throw ToolError("Several homes exist; pass `home`: "
+                + homeManager.homes.map(\.name).joined(separator: ", "))
+        }
+        return home
+    }
+
+    private func resolveHome(_ key: String) throws -> HMHome {
+        let matches = homeManager.homes.filter {
+            $0.uniqueIdentifier.uuidString.caseInsensitiveCompare(key) == .orderedSame
+                || $0.name.caseInsensitiveCompare(key) == .orderedSame
+        }
+        return try unique(matches, kind: "home", key: key) { $0.name }
+    }
+
+    private func resolveRoom(_ key: String, in home: HMHome) throws -> HMRoom {
+        let rooms = [home.roomForEntireHome()] + home.rooms
+        let matches = rooms.filter {
+            $0.uniqueIdentifier.uuidString.caseInsensitiveCompare(key) == .orderedSame
+                || $0.name.caseInsensitiveCompare(key) == .orderedSame
+        }
+        return try unique(matches, kind: "room", key: key) { $0.name }
+    }
+
+    private func resolveAccessory(_ key: String, home homeKey: String?) throws -> (HMHome, HMAccessory) {
+        var matches: [(HMHome, HMAccessory)] = []
+        for home in try homes(matching: homeKey) {
+            for accessory in home.accessories {
+                let byUUID = accessory.uniqueIdentifier.uuidString.caseInsensitiveCompare(key) == .orderedSame
+                let bySerial = serialNumber(of: accessory) == key
+                let byName = accessory.name.caseInsensitiveCompare(key) == .orderedSame
+                if byUUID || bySerial || byName { matches.append((home, accessory)) }
+            }
+        }
+        return try unique(matches, kind: "accessory", key: key) {
+            "\($0.1.name) [\($0.1.uniqueIdentifier.uuidString)] in \($0.1.room?.name ?? "(none)")"
+        }
+    }
+
+    private func unique<T>(_ matches: [T], kind: String, key: String, label: (T) -> String) throws -> T {
+        if matches.count == 1, let match = matches.first { return match }
+        if matches.isEmpty {
+            throw ToolError("No \(kind) matches '\(key)' exactly (UUID, name"
+                + (kind == "accessory" ? " or serial_number" : "") + "). List them first.")
+        }
+        throw ToolError("'\(key)' matches \(matches.count) \(kind)s; use a UUID: "
+            + matches.map(label).joined(separator: "; "))
+    }
+
+    // MARK: - Description helpers
+
+    private func describe(_ accessory: HMAccessory, in home: HMHome, serial: String?) -> [String: Any] {
+        [
+            "home": home.name,
+            "name": accessory.name,
+            "uuid": accessory.uniqueIdentifier.uuidString,
+            "room": accessory.room?.name ?? "(none)",
+            "category": accessory.category.localizedDescription,
+            "manufacturer": accessory.manufacturer ?? "",
+            "model": accessory.model ?? "",
+            "serial_number": serial ?? "",
+            "firmware": accessory.firmwareVersion ?? "",
+            "reachable": accessory.isReachable,
+            "bridged": accessory.isBridged
+        ]
+    }
+
+    /// HAP Serial Number characteristic (0x30). `HMCharacteristicTypeSerialNumber` is deprecated but the
+    /// characteristic is still published; Home Assistant's bridge puts the entity_id in it.
+    private static let serialNumberCharacteristicType = "00000030-0000-1000-8000-0026BB765291"
+
+    private func serialNumber(of accessory: HMAccessory) -> String? {
+        accessory.services
+            .first { $0.serviceType == HMServiceTypeAccessoryInformation }?
+            .characteristics
+            .first { $0.characteristicType == Self.serialNumberCharacteristicType }?
+            .value as? String
+    }
+
+    private func describe(_ status: HMHomeManagerAuthorizationStatus) -> String {
+        if status.contains(.authorized) { return "authorized" }
+        if status.contains(.restricted) { return "restricted" }
+        if status.contains(.determined) { return "denied" }
+        return "not_determined"
+    }
+
+    // MARK: - HTTP responses
+
+    private func sendJSON(_ connection: NWConnection, status: Int, object: Any) {
+        let body = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data("{}".utf8)
+        send(connection, status: status, contentType: "application/json", body: body)
+    }
+
+    private func sendPlain(_ connection: NWConnection, status: Int, message: String,
+                           extraHeaders: [String: String] = [:]) {
+        send(connection, status: status, contentType: "text/plain; charset=utf-8",
+             body: Data(message.utf8), extraHeaders: extraHeaders)
+    }
+
+    private func sendEmpty(_ connection: NWConnection, status: Int) {
+        send(connection, status: status, contentType: nil, body: Data())
+    }
+
+    private func send(_ connection: NWConnection, status: Int, contentType: String?, body: Data,
+                      extraHeaders: [String: String] = [:]) {
+        var head = "HTTP/1.1 \(status) \(HTTPRequest.reason(for: status))\r\n"
+        if let contentType { head += "Content-Type: \(contentType)\r\n" }
+        head += "Content-Length: \(body.count)\r\nConnection: close\r\n"
+        for (name, value) in extraHeaders { head += "\(name): \(value)\r\n" }
+        head += "\r\n"
+        var data = Data(head.utf8)
+        data.append(body)
+        connection.send(content: data, completion: .contentProcessed { _ in connection.cancel() })
+    }
+
+    private func log(_ message: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        print("\(stamp) \(message)")
+        fflush(stdout)
+    }
+}
+
+// MARK: - Supporting types
+
+struct RPCFailure: Error {
+    let code: Int
+    let message: String
+}
+
+struct ToolError: Error {
+    let message: String
+    init(_ message: String) { self.message = message }
+}
+
+enum ToolOutcome {
+    case success(Any)
+    case failure(String)
+
+    var mcpResult: [String: Any] {
+        switch self {
+        case .success(let value):
+            let text = (try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "\(value)"
+            var result: [String: Any] = ["content": [["type": "text", "text": text]], "isError": false]
+            if let object = value as? [String: Any] {
+                result["structuredContent"] = object
+            } else if let array = value as? [Any] {
+                result["structuredContent"] = ["items": array]
+            }
+            return result
+        case .failure(let message):
+            return ["content": [["type": "text", "text": message]], "isError": true]
+        }
+    }
+}
+
+struct ToolArguments {
+    private let values: [String: Any]
+    init(_ values: [String: Any]) { self.values = values }
+
+    func string(_ key: String) -> String? {
+        guard let value = values[key] as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func required(_ key: String) throws -> String {
+        guard let value = string(key) else { throw ToolError("Missing required argument `\(key)`") }
+        return value
+    }
+
+    func requiredName(_ key: String) throws -> String {
+        let value = try required(key)
+        guard value.count <= 64 else { throw ToolError("`\(key)` is longer than 64 characters") }
+        return value
+    }
+}
+
+struct HTTPRequest {
+    let method: String
+    let path: String
+    let headers: [String: String]
+    let body: Data
+
+    enum ParseResult {
+        case complete(HTTPRequest)
+        case incomplete
+        case invalid
+    }
+
+    static func parse(_ data: Data) -> ParseResult {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let headerEnd = data.range(of: separator) else { return .incomplete }
+        guard let head = String(data: data[..<headerEnd.lowerBound], encoding: .utf8) else { return .invalid }
+        var lines = head.components(separatedBy: "\r\n")
+        let requestLine = lines.removeFirst().components(separatedBy: " ")
+        guard requestLine.count >= 2 else { return .invalid }
+
+        var headers: [String: String] = [:]
+        for line in lines {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            headers[name] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        }
+        if headers["transfer-encoding"] != nil { return .invalid }
+
+        let length = Int(headers["content-length"] ?? "0") ?? -1
+        guard length >= 0 else { return .invalid }
+        let bodyStart = headerEnd.upperBound
+        guard data.count - bodyStart >= length else { return .incomplete }
+        let body = data.subdata(in: bodyStart..<(bodyStart + length))
+
+        let path = requestLine[1].components(separatedBy: "?").first ?? requestLine[1]
+        return .complete(HTTPRequest(method: requestLine[0], path: path, headers: headers, body: body))
+    }
+
+    static func reason(for status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 202: return "Accepted"
+        case 400: return "Bad Request"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 413: return "Payload Too Large"
+        default: return "Error"
+        }
+    }
+}
+
+// MARK: - Tool catalog
+
+enum ToolCatalog {
+    private static func schema(_ properties: [String: [String: Any]], required: [String] = []) -> [String: Any] {
+        ["type": "object", "properties": properties, "required": required, "additionalProperties": false]
+    }
+
+    private static let homeProperty: [String: Any] = [
+        "type": "string",
+        "description": "Home name or UUID. Optional when only one home exists."
+    ]
+
+    private static let readOnly: [String: Any] = ["readOnlyHint": true, "openWorldHint": false]
+    private static let idempotentWrite: [String: Any] = [
+        "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false
+    ]
+
+    static let tools: [[String: Any]] = [
+        [
+            "name": "list_homes",
+            "title": "List homes",
+            "description": "List the Apple Home homes this Mac's Apple ID can see, with room and accessory counts.",
+            "inputSchema": schema([:]),
+            "annotations": readOnly
+        ],
+        [
+            "name": "list_rooms",
+            "title": "List rooms",
+            "description": "List rooms (including the default room) with UUIDs and accessory counts.",
+            "inputSchema": schema(["home": homeProperty]),
+            "annotations": readOnly
+        ],
+        [
+            "name": "list_accessories",
+            "title": "List accessories",
+            "description": "List accessories with room, category, manufacturer, serial_number (the Home Assistant "
+                + "entity_id for HA-bridged accessories), reachability and UUID. Optional filters: exact room, "
+                + "and a case-insensitive substring `query` over name, serial_number and room.",
+            "inputSchema": schema([
+                "home": homeProperty,
+                "room": ["type": "string", "description": "Exact room name or UUID."],
+                "query": ["type": "string", "description": "Substring filter over name, serial_number and room."]
+            ]),
+            "annotations": readOnly
+        ],
+        [
+            "name": "set_accessory_room",
+            "title": "Move accessory to room",
+            "description": "Assign an accessory to a room. `accessory` must exactly match a UUID, serial_number "
+                + "(HA entity_id) or full name; `room` an exact room name or UUID. Ambiguous matches are refused.",
+            "inputSchema": schema([
+                "accessory": ["type": "string", "description": "Accessory UUID, serial_number or exact name."],
+                "room": ["type": "string", "description": "Exact room name or UUID."],
+                "home": homeProperty
+            ], required: ["accessory", "room"]),
+            "annotations": idempotentWrite
+        ],
+        [
+            "name": "rename_accessory",
+            "title": "Rename accessory",
+            "description": "Rename an accessory in Apple Home (does not change Home Assistant). `accessory` must "
+                + "exactly match a UUID, serial_number or full name.",
+            "inputSchema": schema([
+                "accessory": ["type": "string", "description": "Accessory UUID, serial_number or exact name."],
+                "new_name": ["type": "string", "description": "New name, at most 64 characters."],
+                "home": homeProperty
+            ], required: ["accessory", "new_name"]),
+            "annotations": idempotentWrite
+        ],
+        [
+            "name": "rename_room",
+            "title": "Rename room",
+            "description": "Rename a room in Apple Home. `room` must exactly match a room name or UUID.",
+            "inputSchema": schema([
+                "room": ["type": "string", "description": "Exact room name or UUID."],
+                "new_name": ["type": "string", "description": "New name, at most 64 characters."],
+                "home": homeProperty
+            ], required: ["room", "new_name"]),
+            "annotations": idempotentWrite
+        ],
+        [
+            "name": "add_room",
+            "title": "Add room",
+            "description": "Create a room in Apple Home. Returns the existing room if one with that name exists.",
+            "inputSchema": schema([
+                "name": ["type": "string", "description": "Room name, at most 64 characters."],
+                "home": homeProperty
+            ], required: ["name"]),
+            "annotations": idempotentWrite
+        ]
+    ]
 }

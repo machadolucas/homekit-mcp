@@ -1,3 +1,7 @@
-CLAUDE.md
 .build/
 build/
+artifacts/
+__pycache__/
+.claude/worktrees
+.claude/settings.local.json
+*.xcuserstate

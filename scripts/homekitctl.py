@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 
 
-DEFAULT_SERVER = os.environ.get("HOMEKIT_MCP_URL", "http://localhost:8080")
+DEFAULT_SERVER = os.environ.get("HOMEKIT_MCP_URL", "http://127.0.0.1:3040")
 
 
 def post_json(base_url: str, path: str, body: dict) -> dict:
@@ -48,6 +48,9 @@ def render_response(payload: dict, output_json: bool) -> None:
 
     result = payload.get("result")
     if isinstance(result, dict):
+        if result.get("isError"):
+            texts = [item.get("text", "") for item in result.get("content", []) if isinstance(item, dict)]
+            raise SystemExit("\n".join(texts) or "Tool call failed")
         content = result.get("content")
         if isinstance(content, list):
             parts = [item.get("text") for item in content if isinstance(item, dict) and item.get("text")]
@@ -76,7 +79,7 @@ def render_response(payload: dict, output_json: bool) -> None:
 def call_tool(base_url: str, tool_name: str, arguments: dict) -> dict:
     return post_json(
         base_url,
-        "/mcp/tools/call",
+        "/mcp",
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -107,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--server",
         default=DEFAULT_SERVER,
-        help="Server base URL. Defaults to HOMEKIT_MCP_URL or http://localhost:8080",
+        help="Server base URL. Defaults to HOMEKIT_MCP_URL or http://127.0.0.1:3040",
     )
     parser.add_argument(
         "--json",
@@ -118,37 +121,34 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("tools", help="List available tools exposed by the server.")
-    subparsers.add_parser("rooms", help="List all HomeKit rooms.")
-    subparsers.add_parser("accessories", help="List all HomeKit accessories.")
+    subparsers.add_parser("homes", help="List HomeKit homes.")
 
-    find_accessory = subparsers.add_parser("find-accessory", help="Find an accessory by name.")
-    find_accessory.add_argument("name")
+    rooms = subparsers.add_parser("rooms", help="List HomeKit rooms.")
+    rooms.add_argument("--home")
 
-    find_room = subparsers.add_parser("find-room", help="Find a room by name.")
-    find_room.add_argument("name")
+    accessories = subparsers.add_parser("accessories", help="List HomeKit accessories.")
+    accessories.add_argument("--home")
+    accessories.add_argument("--room", help="Exact room name or UUID.")
+    accessories.add_argument("--query", help="Substring over name, serial_number and room.")
 
-    room_accessories = subparsers.add_parser("room-accessories", help="List accessories in a room.")
-    room_accessories.add_argument("room_name")
-
-    move = subparsers.add_parser("move", help="Move an accessory to a room by names.")
-    move.add_argument("accessory_name")
-    move.add_argument("room_name")
+    move = subparsers.add_parser("move", help="Move an accessory (UUID, serial_number or exact name) to a room.")
+    move.add_argument("accessory")
+    move.add_argument("room")
+    move.add_argument("--home")
 
     rename_accessory = subparsers.add_parser("rename-accessory", help="Rename an accessory.")
-    rename_accessory.add_argument("accessory_name")
+    rename_accessory.add_argument("accessory")
     rename_accessory.add_argument("new_name")
+    rename_accessory.add_argument("--home")
 
     rename_room = subparsers.add_parser("rename-room", help="Rename a room.")
-    rename_room.add_argument("room_name")
+    rename_room.add_argument("room")
     rename_room.add_argument("new_name")
+    rename_room.add_argument("--home")
 
-    for command_name, help_text in [
-        ("on", "Turn an accessory on."),
-        ("off", "Turn an accessory off."),
-        ("toggle", "Toggle an accessory."),
-    ]:
-        parser_for_command = subparsers.add_parser(command_name, help=help_text)
-        parser_for_command.add_argument("accessory_name")
+    add_room = subparsers.add_parser("add-room", help="Create a room.")
+    add_room.add_argument("name")
+    add_room.add_argument("--home")
 
     call = subparsers.add_parser("call", help="Call any tool with key=value arguments.")
     call.add_argument("tool_name")
@@ -161,46 +161,39 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    def opt(**values: object) -> dict:
+        return {key: value for key, value in values.items() if value}
+
     if args.command == "tools":
         payload = post_json(
             args.server,
-            "/mcp/tools/list",
+            "/mcp",
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
         )
+    elif args.command == "homes":
+        payload = call_tool(args.server, "list_homes", {})
     elif args.command == "rooms":
-        payload = call_tool(args.server, "get_all_rooms", {})
+        payload = call_tool(args.server, "list_rooms", opt(home=args.home))
     elif args.command == "accessories":
-        payload = call_tool(args.server, "get_all_accessories", {})
-    elif args.command == "find-accessory":
-        payload = call_tool(args.server, "get_accessory_by_name", {"name": args.name})
-    elif args.command == "find-room":
-        payload = call_tool(args.server, "get_room_by_name", {"name": args.name})
-    elif args.command == "room-accessories":
-        payload = call_tool(args.server, "get_room_accessories", {"room_name": args.room_name})
+        payload = call_tool(
+            args.server, "list_accessories", opt(home=args.home, room=args.room, query=args.query)
+        )
     elif args.command == "move":
         payload = call_tool(
-            args.server,
-            "set_accessory_room_by_name",
-            {"accessory_name": args.accessory_name, "room_name": args.room_name},
+            args.server, "set_accessory_room", opt(accessory=args.accessory, room=args.room, home=args.home)
         )
     elif args.command == "rename-accessory":
         payload = call_tool(
             args.server,
             "rename_accessory",
-            {"accessory_name": args.accessory_name, "new_name": args.new_name},
+            opt(accessory=args.accessory, new_name=args.new_name, home=args.home),
         )
     elif args.command == "rename-room":
         payload = call_tool(
-            args.server,
-            "rename_room",
-            {"room_name": args.room_name, "new_name": args.new_name},
+            args.server, "rename_room", opt(room=args.room, new_name=args.new_name, home=args.home)
         )
-    elif args.command == "on":
-        payload = call_tool(args.server, "accessory_on", {"accessory_name": args.accessory_name})
-    elif args.command == "off":
-        payload = call_tool(args.server, "accessory_off", {"accessory_name": args.accessory_name})
-    elif args.command == "toggle":
-        payload = call_tool(args.server, "accessory_toggle", {"accessory_name": args.accessory_name})
+    elif args.command == "add-room":
+        payload = call_tool(args.server, "add_room", opt(name=args.name, home=args.home))
     elif args.command == "call":
         payload = call_tool(args.server, args.tool_name, parse_key_values(args.params))
     else:

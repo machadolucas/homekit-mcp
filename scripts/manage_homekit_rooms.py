@@ -117,7 +117,7 @@ def run_text(command: List[str], env: Dict[str, str]) -> str:
 
 def get_homekit_accessories(env: Dict[str, str]) -> List[Accessory]:
     payload = run_json(["homekitctl", "--json", "accessories"], env)
-    items = payload["result"]["_meta"]["accessories"]
+    items = payload["result"]["structuredContent"]["items"]
     return [
         Accessory(
             name=item.get("name", ""),
@@ -131,7 +131,7 @@ def get_homekit_accessories(env: Dict[str, str]) -> List[Accessory]:
 
 def get_homekit_rooms(env: Dict[str, str]) -> List[str]:
     payload = run_json(["homekitctl", "--json", "rooms"], env)
-    items = payload["result"]["_meta"]["rooms"]
+    items = payload["result"]["structuredContent"]["items"]
     return sorted(item.get("name", "") for item in items if item.get("name"))
 
 
@@ -321,7 +321,9 @@ def apply_moves(rows: List[PlanRow], valid_rooms: set[str], env: Dict[str, str])
             )
             continue
 
-        run_text(["homekitctl", "move", row.name, row.target_room], env)
+        # Address by serial (the HA entity_id) when known; names are only unique by convention.
+        target = row.serial if is_known_serial(row.serial) else row.name
+        run_text(["homekitctl", "move", target, row.target_room], env)
         moves += 1
     return moves
 

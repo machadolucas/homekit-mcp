@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(sed -n *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(wc *)",
+      "Bash(swift test*)",
+      "Bash(python3 -m py_compile *)",
+      "Bash(python3 scripts/homekitctl.py *)",
+      "Bash(curl -fsS http://127.0.0.1:3040/health*)",
+      "Bash(tail * ~/Library/Logs/homekit-mcp.log*)",
+      "Bash(launchctl print gui/*/com.local.homekit-mcp*)"
+    ]
+  }
+}

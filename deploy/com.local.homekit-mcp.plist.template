@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the HomeKit MCP server. Rendered by deploy/install.sh
+  (@HOME@ and @PORT@ are substituted). Must be a *user* LaunchAgent: the
+  HomeKit framework needs the logged-in GUI session and the user's iCloud
+  Home data. No secrets belong in this file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.homekit-mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@HOME@/Applications/HomeKitMCP.app/Contents/MacOS/HomeKitMCP</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOMEKIT_MCP_PORT</key>
+        <string>@PORT@</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/homekit-mcp.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/homekit-mcp.log</string>
+</dict>
+</plist>

@@ -1,194 +1,76 @@
-# HomeKit MCP ... and CLI ... and Room Plan/Apply script
+# HomeKit MCP (organisation-only fork)
 
-[![GitHub Release](https://img.shields.io/github/v/release/TimCinel/homekit-mcp?style=for-the-badge)](https://github.com/TimCinel/homekit-mcp/releases)
-[![GitHub Activity](https://img.shields.io/github/commit-activity/m/TimCinel/homekit-mcp?style=for-the-badge)](https://github.com/TimCinel/homekit-mcp/commits/main)
-[![License](https://img.shields.io/github/license/TimCinel/homekit-mcp?style=for-the-badge)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/TimCinel/homekit-mcp/ci.yml?style=for-the-badge&label=CI)](https://github.com/TimCinel/homekit-mcp/actions/workflows/ci.yml)
+A Mac Catalyst app that serves a **loopback-only MCP server over Apple's HomeKit framework**, so
+AI agents running on the same Mac can read and tidy how a Home is organised in the Apple Home app:
+rooms, which room each accessory is in, and names.
 
-HTTP-based Model Context Protocol (MCP) server for HomeKit. Provides tools to list and manage HomeKit accessories and rooms.
+Fork of [TimCinel/homekit-mcp](https://github.com/TimCinel/homekit-mcp) (MIT). Main differences
+(details in [docs/fork-changes.md](docs/fork-changes.md)):
 
-Also a CLI for HomeKit.
+- Binds `127.0.0.1` only and refuses browser-originated requests (`Origin` / `Host` checks).
+- **No device control.** No tools to switch, dim, open, lock or unlock. Use Home Assistant or the
+  Home app for that.
+- Writes need an exact UUID, serial number or full name, and ambiguous matches are refused.
+- Accessories bridged from Home Assistant can be addressed by entity_id, because HA publishes it
+  as the serial number.
+- Current MCP Streamable HTTP behaviour (protocol negotiation, `202` for notifications,
+  `isError` tool results, `structuredContent`).
 
-Also a script to help manage Home Assistant accessories across rooms, which is the actual motivation for all of this.
+## Why an app?
 
-This is implemented as a macOS app rather than a CLI tool because HomeKit requires a signed binary with proper entitlements that can only be achieved through an Xcode project.
+HomeKit is only available to a **signed app with the `com.apple.developer.homekit`
+entitlement**, running in the logged-in user's session. A plain CLI or daemon cannot get it.
 
-## Prerequisites
+## Tools
 
-- macOS 13.0+ with HomeKit setup
-- Xcode (with Command Line Tools)
-- Apple ID (free tier sufficient for development)
-- HomeKit accessories configured in the Home app
+| Tool | Purpose |
+|---|---|
+| `list_homes` | Homes with room and accessory counts |
+| `list_rooms` | Rooms (incl. the default room) with UUIDs |
+| `list_accessories` | Accessories with room, category, serial number, reachability; filter by `room` / `query` |
+| `set_accessory_room` | Move an accessory to a room |
+| `rename_accessory` | Rename an accessory in Apple Home |
+| `rename_room` | Rename a room |
+| `add_room` | Create a room |
 
-## Quick Start
+Full reference: [docs/tools.md](docs/tools.md).
 
-```bash
-git clone https://github.com/TimCinel/HomeKitSync.git
-cd HomeKitSync
-make build
-make run
-```
+## Quick start
 
-The server will start on `http://localhost:8080`.
-
-Add to Claude Code:
-```bash
-claude mcp add --transport http homekit http://localhost:8080/mcp
-```
-
-## Available MCP Tools
-
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `get_all_accessories` | List all HomeKit accessories with names, rooms, categories, and UUIDs | None |
-| `get_all_rooms` | List all HomeKit rooms with names and UUIDs | None |
-| `set_accessory_room` | Move an accessory to a different room using UUIDs | `accessory_uuid`, `room_uuid` |
-| `get_accessory_by_name` | Find a HomeKit accessory by name | `name` |
-| `get_room_by_name` | Find a HomeKit room by name | `name` |
-| `set_accessory_room_by_name` | Move an accessory to a different room using names | `accessory_name`, `room_name` |
-| `rename_accessory` | Rename a HomeKit accessory | `accessory_name`, `new_name` |
-| `rename_room` | Rename a HomeKit room | `room_name`, `new_name` |
-| `get_room_accessories` | Get all accessories in a specific room | `room_name` |
-| `accessory_on` | Turn on an accessory (lights, switches) or open covers | `accessory_name` |
-| `accessory_off` | Turn off an accessory (lights, switches) or close covers | `accessory_name` |
-| `accessory_toggle` | Toggle an accessory between on/off or open/close | `accessory_name` |
-
-## Available CLI Tools
-
-### CLI Wrapper
-
-If you would rather script against the HTTP service directly, use the lightweight Python CLI in [scripts/homekitctl.py](scripts/homekitctl.py). It uses only the Python standard library, so it can run from non-macOS machines as long as they can reach the Mac host over HTTP.
+Requirements: macOS 13+, full Xcode, an Apple ID in Xcode → Settings → Accounts whose team can
+sign apps with HomeKit, and the Mac signed into iCloud as an admin member of the Home.
 
 ```bash
-scripts/homekitctl.py --server http://mac-mini.local:8080 rooms
-scripts/homekitctl.py --server http://mac-mini.local:8080 accessories
-scripts/homekitctl.py --server http://mac-mini.local:8080 find-accessory "Desk Lamp"
-scripts/homekitctl.py --server http://mac-mini.local:8080 move "Desk Lamp" Office
-scripts/homekitctl.py --server http://mac-mini.local:8080 on "Desk Lamp"
+git clone https://github.com/machadolucas/homekit-mcp.git
+cd homekit-mcp
+export DEVELOPMENT_TEAM=XXXXXXXXXX          # your team ID (Xcode → Settings → Accounts)
+deploy/install.sh                           # build, sign, install to ~/Applications, start LaunchAgent
+curl -fsS http://127.0.0.1:3040/health
+claude mcp add --scope user --transport http homekit http://127.0.0.1:3040/mcp
 ```
 
-The CLI talks to `http://localhost:8080` by default. Override it with `--server` or `HOMEKIT_MCP_URL`:
+Approve the "would like to access your home data" dialog on first launch. Operations, re-signing
+and troubleshooting: [docs/operations.md](docs/operations.md).
 
-```bash
-python3 scripts/homekitctl.py --server http://localhost:8080 rooms
-HOMEKIT_MCP_URL=http://mac-mini.local:8080 python3 scripts/homekitctl.py tools
-```
+## CLI and room sync
 
-For anything not covered by the convenience commands, use raw tool calls:
-
-```bash
-scripts/homekitctl.py --server http://mac-mini.local:8080 call rename_room room_name=Office new_name=Study
-```
-
-### Room Manager - Plan and Apply
-
-It's kind of like Terraform but for your HomeKit?
-
-Features:
-* Use Room/Area from Home Assistant to assign rooms (plan and apply)
-* Back up current state snapshot in CSV
-* Edit state snapshot using text editor
-* Restore state snapshot using CSV
-
-> [!NOTE]
-> In both examples below, **HomeKitMCP.app** is running locally, and the details for Home Assistant
-> are provided in the env.
-
-Prereqs:
-
-```
-$ export HASS_TOKEN=eyJh...o
-$ export HASS_SERVER=https://assistant-home/
-$ export HOMEKIT_MCP_URL=http://localhost:8080
-...
-```
-
-Example plan/apply usage:
-
-```
-$ scripts/manage_homekit_rooms.py
-
-Wrote plan CSV: artifacts/homekit-plan-20260312-223133.csv
-Accessories scanned: 201
-Planned moves: 8
-Dry run only. Re-run with --apply to move accessories.
-
-$ ./manage_homekit_rooms.py --apply-plan artifacts/homekit-plan-20260312-223133.csv
-Loaded plan CSV: artifacts/homekit-plan-20260312-223133.csv
-Rows in plan: 99
-Planned moves: 8
-Moves applied: 8
-Wrote snapshot CSV: artifacts/homekit-snapshot-20260312-223725.csv
-```
-
-Example snapshot usage:
-
-```
-$ ./manage_homekit_rooms.py --restore artifacts/homekit-snapshot-20260312-223725.csv --apply
-Wrote plan CSV: artifacts/homekit-plan-20260312-224133.csv
-Accessories scanned: 201
-Planned moves: 1
-Moves applied: 1
-Wrote snapshot CSV: artifacts/homekit-snapshot-20260312-224133.csv
-```
+- `scripts/homekitctl.py`: standard-library CLI over the HTTP endpoint
+  (`homes`, `rooms`, `accessories`, `move`, `rename-accessory`, `rename-room`, `add-room`, `call`).
+- `scripts/manage_homekit_rooms.py`: upstream's plan/apply tool that sets Apple Home rooms from
+  Home Assistant areas, matching on the serial number (= HA entity_id). It needs `hass-cli` with
+  `HASS_SERVER` and `HASS_TOKEN`, and `homekitctl` on `PATH`. It writes CSV plans and snapshots
+  to `artifacts/`, which is gitignored. Review a plan before `--apply-plan`.
 
 ## Development
 
-### Testing
-
-Full test suite (requires HomeKit):
 ```bash
-make test
+swift test                                   # SwiftPM core tests (no HomeKit needed)
+xcodebuild -project HomeKitSync.xcodeproj -scheme HomeKitSync \
+  -destination 'platform=macOS,variant=Mac Catalyst' CODE_SIGNING_ALLOWED=NO build   # compile check
 ```
 
-CI-friendly tests (no HomeKit dependency):
-```bash
-make test-ci
-```
-
-### Code Quality
-
-```bash
-make install-deps  # Install SwiftLint
-make lint
-make lint-fix      # Auto-fix issues
-```
-
-## API Reference
-
-### HTTP Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/mcp` | MCP server discovery |
-| `POST` | `/mcp/tools/list` | List available tools |
-| `POST` | `/mcp/tools/call` | Execute tools |
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests (`make test-ci`) and linting (`make lint`)
-5. Submit a pull request
+Agent instructions for contributors: [CLAUDE.md](CLAUDE.md) (also `AGENTS.md`).
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Troubleshooting
-
-**"No such module 'HomeKit'"**
-- Ensure you're building for the correct target
-- Verify Xcode is properly installed
-
-**"App cannot run on the current OS version"**
-- Check deployment target in Xcode project settings
-
-**"HomeKit permissions denied"**
-- Verify HomeKit entitlement is enabled
-- Check Apple ID signing configuration
-
-**Server not reachable**
-- Ensure app is running and visible in Dock
-- Verify server logs in Console.app (search for "MCP") or run `log stream --info --process $(ps aux | grep MCP | grep -v grep | awk '{ print $2 }')`
+MIT, see [LICENSE](LICENSE). Original work © Tim Cinel.

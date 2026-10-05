@@ -1,10 +1,14 @@
 # HomeKit MCP Server Makefile
 
-.PHONY: build test test-ci lint lint-fix install-deps clean cli
+.PHONY: build install test test-ci lint lint-fix install-deps clean cli
 
 # Build the project
 build:
 	xcodebuild -project HomeKitSync.xcodeproj -scheme HomeKitSync -configuration Debug -destination 'platform=macOS,variant=Mac Catalyst' -allowProvisioningUpdates
+
+# Build, sign, install to ~/Applications and (re)start the LaunchAgent (see deploy/install.sh)
+install:
+	deploy/install.sh
 
 # Run tests (when test target is set up)
 test:

@@ -1,0 +1,8 @@
+# Codex project configuration for homekit-mcp.
+# Shared instructions live in CLAUDE.md (AGENTS.md is a symlink to it) and
+# skills in .claude/skills (.agents/skills is a symlink). Edit the sources.
+# This repository is PUBLIC (a fork): no secrets, team IDs, Apple IDs,
+# household names, IPs or accessory inventories belong in it.
+#
+# The running server is registered as an MCP server in the user-level Codex
+# config on the host, not here.
