@@ -54,8 +54,11 @@ config is `.codex/config.toml` (no secrets). Claude's tool allow-list lives in
 - Requires full Xcode (not just Command Line Tools). Use `DEVELOPER_DIR` rather than
   `xcode-select` if the active developer dir is the CLT.
 - The app must be **signed with a team that has the HomeKit capability**; unsigned builds compile
-  but HomeKit returns no homes. `deploy/install.sh` passes `DEVELOPMENT_TEAM` and
-  `-allowProvisioningUpdates`.
+  but HomeKit returns no homes. The profile is created once in the Xcode GUI (Signing &
+  Capabilities). Discard the `DEVELOPMENT_TEAM` that writes into `project.pbxproj`, because the
+  team is passed at build time. Details in [docs/operations.md](docs/operations.md).
+- Never launch the built app by exec'ing `Contents/MacOS/HomeKitMCP` from launchd: Mac Catalyst
+  apps must start through LaunchServices (`open`).
 - Builds are heavy on the reference host: `deploy/install.sh` wraps `xcodebuild` in the host's
   `heavy-job.sh` guard when present. Exit code 75 means "refused, not enough headroom": stop and
   report, do not retry in a loop.

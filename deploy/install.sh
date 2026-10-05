@@ -6,9 +6,12 @@
 #
 # Signing: the Apple Developer team ID is read from DEVELOPMENT_TEAM, or from
 # ~/.config/macserver/homekit-mcp.env (DEVELOPMENT_TEAM=XXXXXXXXXX). It is kept
-# out of the repo, which is public. The Apple ID itself must be added in
-# Xcode -> Settings -> Accounts once; xcodebuild then creates/renews the
-# provisioning profile (-allowProvisioningUpdates).
+# out of the repo, which is public. The Apple ID must be added in
+# Xcode -> Settings -> Accounts, and the provisioning profile created once by
+# selecting the team in the Xcode GUI (Signing & Capabilities). Command-line
+# xcodebuild then signs with that local profile. ALLOW_PROVISIONING_UPDATES=1
+# adds -allowProvisioningUpdates, which only works where xcodebuild can use the
+# Xcode account (on macserver it fails with "No Account for Team").
 #
 # On the macserver host, heavy jobs go through ~/claude/scripts/heavy-job.sh
 # when it exists (exit 75 = refused for lack of headroom; do not retry blindly).
@@ -41,13 +44,15 @@ build() {
     fi
     local runner=()
     [[ -x "$HOME/claude/scripts/heavy-job.sh" ]] && runner=("$HOME/claude/scripts/heavy-job.sh")
+    local provisioning=()
+    [[ "${ALLOW_PROVISIONING_UPDATES:-0}" == "1" ]] && provisioning=(-allowProvisioningUpdates)
     ${runner[@]+"${runner[@]}"} xcodebuild \
         -project "$REPO/HomeKitSync.xcodeproj" \
         -scheme HomeKitSync \
         -configuration Release \
         -destination 'platform=macOS,variant=Mac Catalyst' \
         -derivedDataPath "$DERIVED" \
-        -allowProvisioningUpdates \
+        ${provisioning[@]+"${provisioning[@]}"} \
         DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
         CODE_SIGN_STYLE=Automatic \
         build
@@ -61,6 +66,9 @@ codesign -d --entitlements - "$BUILT_APP" 2>/dev/null | grep -q com.apple.develo
     || { echo "Built app lacks the HomeKit entitlement" >&2; exit 1; }
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+# bootout stops the `open -W` wrapper, not the app LaunchServices started.
+pkill -x HomeKitMCP 2>/dev/null || true
+for _ in $(seq 1 10); do pgrep -x HomeKitMCP >/dev/null || break; sleep 1; done
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 rm -rf "$APP_DEST"
 ditto "$BUILT_APP" "$APP_DEST"

@@ -10,15 +10,27 @@
 <dict>
     <key>Label</key>
     <string>com.local.homekit-mcp</string>
+    <!--
+      Launched through LaunchServices (`open`), not by exec'ing the binary:
+      a Mac Catalyst app started directly by launchd aborts with
+      "_mainSceneIdentifier should have been set by now!". `-W` keeps `open`
+      alive until the app quits, so KeepAlive restarts it; `-n` would allow
+      duplicates, so it is deliberately absent. stdout/stderr and the port are
+      handed to the app by `open` itself.
+    -->
     <key>ProgramArguments</key>
     <array>
-        <string>@HOME@/Applications/HomeKitMCP.app/Contents/MacOS/HomeKitMCP</string>
+        <string>/usr/bin/open</string>
+        <string>-W</string>
+        <string>-g</string>
+        <string>--env</string>
+        <string>HOMEKIT_MCP_PORT=@PORT@</string>
+        <string>--stdout</string>
+        <string>@HOME@/Library/Logs/homekit-mcp.log</string>
+        <string>--stderr</string>
+        <string>@HOME@/Library/Logs/homekit-mcp.log</string>
+        <string>@HOME@/Applications/HomeKitMCP.app</string>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOMEKIT_MCP_PORT</key>
-        <string>@PORT@</string>
-    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -28,8 +40,8 @@
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>@HOME@/Library/Logs/homekit-mcp.log</string>
+    <string>@HOME@/Library/Logs/homekit-mcp.launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>@HOME@/Library/Logs/homekit-mcp.log</string>
+    <string>@HOME@/Library/Logs/homekit-mcp.launchd.log</string>
 </dict>
 </plist>

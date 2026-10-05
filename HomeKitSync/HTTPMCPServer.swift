@@ -24,6 +24,9 @@ class HTTPMCPServer: NSObject, HMHomeManagerDelegate {
 
     private let homeManager = HMHomeManager()
     private var homesLoaded = false
+    /// Serial numbers read explicitly from the Accessory Information service, keyed by accessory UUID.
+    /// `HMCharacteristic.value` is not pre-populated for this characteristic on recent macOS.
+    private var serialCache: [UUID: String] = [:]
     let port: UInt16
     private var listener: NWListener?
 
@@ -48,6 +51,47 @@ class HTTPMCPServer: NSObject, HMHomeManagerDelegate {
             .map { "\($0.name) (\($0.accessories.count) accessories, \($0.rooms.count) rooms)" }
             .joined(separator: ", ")
         log("Homes loaded: \(manager.homes.count) [\(summary)]")
+        refreshSerialNumbers()
+    }
+
+    private func refreshSerialNumbers() {
+        var found = 0
+        var pending = 0
+        var read = 0
+        let accessories = homeManager.homes.flatMap(\.accessories)
+        for accessory in accessories {
+            guard let characteristic = serialCharacteristic(of: accessory) else { continue }
+            found += 1
+            if let value = characteristic.value as? String, !value.isEmpty {
+                serialCache[accessory.uniqueIdentifier] = value
+                read += 1
+                continue
+            }
+            pending += 1
+            characteristic.readValue { [weak self] error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    pending -= 1
+                    if error == nil, let value = characteristic.value as? String, !value.isEmpty {
+                        self.serialCache[accessory.uniqueIdentifier] = value
+                        read += 1
+                    }
+                    if pending == 0 {
+                        self.log("Serial numbers: \(read) of \(accessories.count) accessories "
+                            + "(\(found) expose the characteristic)")
+                    }
+                }
+            }
+        }
+        if pending == 0 {
+            log("Serial numbers: \(read) of \(accessories.count) accessories (\(found) expose the characteristic)")
+        }
+        if found == 0, let sample = accessories.first {
+            let types = sample.services
+                .first { $0.serviceType == HMServiceTypeAccessoryInformation }?
+                .characteristics.map(\.characteristicType) ?? []
+            log("No serial characteristic; Accessory Information of '\(sample.name)' has: \(types)")
+        }
     }
 
     func homeManager(_ manager: HMHomeManager, didUpdate status: HMHomeManagerAuthorizationStatus) {
@@ -499,12 +543,16 @@ class HTTPMCPServer: NSObject, HMHomeManagerDelegate {
     /// characteristic is still published; Home Assistant's bridge puts the entity_id in it.
     private static let serialNumberCharacteristicType = "00000030-0000-1000-8000-0026BB765291"
 
-    private func serialNumber(of accessory: HMAccessory) -> String? {
+    private func serialCharacteristic(of accessory: HMAccessory) -> HMCharacteristic? {
         accessory.services
             .first { $0.serviceType == HMServiceTypeAccessoryInformation }?
             .characteristics
-            .first { $0.characteristicType == Self.serialNumberCharacteristicType }?
-            .value as? String
+            .first { $0.characteristicType == Self.serialNumberCharacteristicType }
+    }
+
+    private func serialNumber(of accessory: HMAccessory) -> String? {
+        if let cached = serialCache[accessory.uniqueIdentifier] { return cached }
+        return serialCharacteristic(of: accessory)?.value as? String
     }
 
     private func describe(_ status: HMHomeManagerAuthorizationStatus) -> String {
