@@ -25,6 +25,11 @@
    Command-line `xcodebuild` then signs with that local profile. `-allowProvisioningUpdates` from the
    command line can fail with "No Account for Team" even when the account works in the GUI, so
    `install.sh` only passes it when `ALLOW_PROVISIONING_UPDATES=1`.
+   App IDs are unique across **all** teams. Once one team has registered a bundle ID (even a
+   Personal Team, through a test signing), another team gets "Failed Registering Bundle
+   Identifier … not available". Use a different `PRODUCT_BUNDLE_IDENTIFIER`. The fork moved from
+   `com.machadolucas.homekitmcp` to `com.machadolucas.homekit-mcp` for this reason. A new
+   bundle ID is a new app to macOS, so the Home permission is asked again.
 4. The Mac signed into iCloud with an Apple ID that is a member of the Home. Changing rooms and
    names needs that member to be an **admin**.
 5. A logged-in GUI session. HomeKit is only available to an app in the user's session, so this is

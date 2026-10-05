@@ -18,7 +18,7 @@ SwiftPM core under `Sources/` and its tests are unchanged.
 | Health | Welcome HTML on `/` | `GET /health` (and `/`) → JSON: status, authorization, homes | Used by `deploy/install.sh` and monitoring |
 | Logging | Emoji-heavy, logged full tool arguments | One ISO-timestamped line per write (`WRITE …`) plus lifecycle events | Writes can be audited in the LaunchAgent log |
 | New tools | — | `list_homes`, `add_room`; `list_accessories` takes `room` and `query` filters | `get_accessory_by_name`, `get_room_by_name` and `get_room_accessories` are covered by the filters |
-| Bundle ID / team | `com.timcinel.homekitmcp1`, upstream's team ID hard-coded | `com.machadolucas.homekitmcp`; `DEVELOPMENT_TEAM` empty in the project, passed at build time | The team ID stays out of a public repo, and other people can build with their own team |
+| Bundle ID / team | `com.timcinel.homekitmcp1`, upstream's team ID hard-coded | `com.machadolucas.homekit-mcp`; `DEVELOPMENT_TEAM` empty in the project, passed at build time | The team ID stays out of a public repo, and other people can build with their own team |
 | Deployment | `make run` from Xcode | `deploy/install.sh` + LaunchAgent `com.local.homekit-mcp`, which starts the app through `open -W` | Runs unattended on an always-on Mac. Mac Catalyst apps cannot be started by launchd exec'ing the binary |
 
 Upstream's `HomeKitSync/MCPServer.swift` (stdio prototype plus the shared `MCPRequest`/`AnyEncodable`
