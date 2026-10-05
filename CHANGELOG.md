@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP Streamable HTTP compliance: protocol negotiation, 202 for notifications, `ping`,
   `isError` results, `structuredContent`; legacy `/mcp/tools/*` and `/events` routes removed.
 - HomeKit writes complete asynchronously with a 10 s timeout instead of blocking the main queue.
-- Bundle ID `com.machadolucas.homekitmcp`; team ID supplied at build time.
+- Bundle ID `com.machadolucas.homekit-mcp`; team ID supplied at build time.
 
 ### Removed
 - `accessory_on`, `accessory_off`, `accessory_toggle` (device control is out of scope).
