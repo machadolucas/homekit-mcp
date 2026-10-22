@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Runs as a menu-bar app: no Dock icon (`LSUIElement`), a menu-bar item (SF Symbol `homekit`)
+  with live status, "Show Status Window", "Open Log" and "Restart Server". No window at launch;
+  closing the status window no longer quits the app.
+
+### Added
+- `StatusBarPlugin` target: an AppKit bundle embedded in `Contents/PlugIns` that provides the
+  menu-bar item, since Mac Catalyst cannot use `NSStatusItem`. Interface in `Shared/StatusBarBridge.swift`.
+
 ## [2.0.0-fork] - 2026-10-05 (machadolucas fork)
 
 ### Changed

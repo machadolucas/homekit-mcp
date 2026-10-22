@@ -39,7 +39,9 @@ config is `.codex/config.toml` (no secrets). Claude's tool allow-list lives in
 | Path | Purpose |
 |---|---|
 | `HomeKitSync/HTTPMCPServer.swift` | HTTP listener, MCP JSON-RPC (Streamable HTTP, JSON responses), tools, HomeKit calls |
-| `HomeKitSync/MCPApp.swift` | SwiftUI shell: status window, owns the server |
+| `HomeKitSync/MCPApp.swift` | SwiftUI shell: owns the server, loads the menu-bar plug-in, status window |
+| `StatusBarPlugin/StatusBarController.swift` | AppKit plug-in (`Contents/PlugIns/StatusBarPlugin.bundle`): menu-bar item, hides the launch window, keeps the app alive with no windows |
+| `Shared/StatusBarBridge.swift` | `@objc` protocols between the app and the plug-in, compiled into both targets |
 | `HomeKitSync/MCPServer.swift`, `HomeKitManager.swift` | Upstream leftovers (shared models used by tests; unused stdio server) |
 | `HomeKitSync/HomeKitSync.entitlements` | `com.apple.developer.homekit` |
 | `Sources/`, `Tests/` | Upstream SwiftPM core + tests (`swift test`, no HomeKit needed) |

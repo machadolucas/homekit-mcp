@@ -61,8 +61,18 @@ running and so the additional environment variables … could not be set" in
 console**. Until someone clicks Allow, `/health` reports `authorization: not_determined` and
 every tool fails. If it was denied, re-enable it in System Settings → Privacy & Security → Home.
 
-The app also opens a small status window. It can be minimised; quitting it stops the server
-until launchd restarts it (KeepAlive, 30 s throttle).
+The app has no Dock icon and opens no window at launch. It shows a menu-bar item (house icon)
+with the listener, HomeKit authorization and home/accessory counts, plus "Show Status Window",
+"Open Log" and "Restart Server". Closing the status window leaves the server running. "Restart
+Server" quits the app; launchd starts it again (KeepAlive, 30 s throttle).
+
+How it works, since Mac Catalyst has no `NSStatusItem`: the AppKit bundle
+`Contents/PlugIns/StatusBarPlugin.bundle` is loaded at launch. It owns the status item, orders out
+the window SwiftUI opens at launch (until the menu asks for it), and makes the Catalyst app
+delegate answer NO to `applicationShouldTerminateAfterLastWindowClosed:`. If the bundle fails to
+load (log: `Status-bar plug-in not loaded`), the app falls back to the old behaviour: a visible
+window, and closing it quits. `UIApplicationSupportsMultipleScenes` is on so the menu can open a
+new window after the old one was closed.
 
 ## Register with agents
 

@@ -205,6 +205,19 @@ class HTTPMCPServer: NSObject, HMHomeManagerDelegate {
         return ["127.0.0.1", "localhost", "::1"].contains(host)
     }
 
+    /// Short human-readable status for the menu-bar item.
+    func statusLines() -> [String] {
+        var lines = ["Listening on 127.0.0.1:\(port)",
+                     "HomeKit: \(describe(homeManager.authorizationStatus))"]
+        if !homesLoaded {
+            lines.append("Loading homes…")
+        }
+        for home in homeManager.homes {
+            lines.append("\(home.name): \(home.accessories.count) accessories, \(home.rooms.count) rooms")
+        }
+        return lines
+    }
+
     private func healthObject() -> [String: Any] {
         [
             "status": homesLoaded ? "ok" : "starting",

@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A10000000000000000000002 /* StatusBarBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* StatusBarBridge.swift */; };
+		A10000000000000000000003 /* StatusBarBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* StatusBarBridge.swift */; };
+		A10000000000000000000005 /* StatusBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* StatusBarController.swift */; };
+		A10000000000000000000007 /* StatusBarPlugin.bundle in Embed PlugIns */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* StatusBarPlugin.bundle */; platformFilter = maccatalyst; };
 		D12345678901234567890123 /* MCPApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = D12345678901234567890124 /* MCPApp.swift */; };
 		D12345678901234567890143 /* MCPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D12345678901234567890144 /* MCPServer.swift */; };
 		D12345678901234567890147 /* HTTPMCPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D12345678901234567890148 /* HTTPMCPServer.swift */; };
@@ -15,7 +19,28 @@
 		D12345678901234567890164 /* CITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D12345678901234567890165 /* CITests.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		A10000000000000000000008 /* Embed PlugIns */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A10000000000000000000007 /* StatusBarPlugin.bundle in Embed PlugIns */,
+			);
+			name = "Embed PlugIns";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXContainerItemProxy section */
+		A10000000000000000000012 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D12345678901234567890135 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000000000000000000009;
+			remoteInfo = StatusBarPlugin;
+		};
 		D12345678901234567890154 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = D12345678901234567890135 /* Project object */;
@@ -26,6 +51,9 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		A10000000000000000000001 /* StatusBarBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarBridge.swift; sourceTree = "<group>"; };
+		A10000000000000000000004 /* StatusBarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarController.swift; sourceTree = "<group>"; };
+		A10000000000000000000006 /* StatusBarPlugin.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = StatusBarPlugin.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
 		D12345678901234567890124 /* MCPApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPApp.swift; sourceTree = "<group>"; };
 		D12345678901234567890126 /* HomeKitMCP.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HomeKitMCP.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D12345678901234567890127 /* HomeKitSync.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HomeKitSync.entitlements; sourceTree = "<group>"; };
@@ -39,6 +67,13 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000011 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		D12345678901234567890128 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -60,6 +95,8 @@
 			isa = PBXGroup;
 			children = (
 				D12345678901234567890130 /* HomeKitSync */,
+				A10000000000000000000017 /* Shared */,
+				A10000000000000000000018 /* StatusBarPlugin */,
 				D12345678901234567890156 /* HomeKitSyncTests */,
 				D12345678901234567890131 /* Products */,
 			);
@@ -83,6 +120,7 @@
 			children = (
 				D12345678901234567890126 /* HomeKitMCP.app */,
 				D12345678901234567890153 /* HomeKitSyncTests.xctest */,
+				A10000000000000000000006 /* StatusBarPlugin.bundle */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -96,6 +134,22 @@
 			path = HomeKitSyncTests;
 			sourceTree = "<group>";
 		};
+		A10000000000000000000017 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000001 /* StatusBarBridge.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000018 /* StatusBarPlugin */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000004 /* StatusBarController.swift */,
+			);
+			path = StatusBarPlugin;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -106,10 +160,12 @@
 				D12345678901234567890134 /* Sources */,
 				D12345678901234567890128 /* Frameworks */,
 				D12345678901234567890146 /* Resources */,
+				A10000000000000000000008 /* Embed PlugIns */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				A10000000000000000000013 /* PBXTargetDependency */,
 			);
 			name = HomeKitSync;
 			productName = HomeKitSync;
@@ -134,6 +190,22 @@
 			productReference = D12345678901234567890153 /* HomeKitSyncTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		A10000000000000000000009 /* StatusBarPlugin */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000014 /* Build configuration list for PBXNativeTarget "StatusBarPlugin" */;
+			buildPhases = (
+				A10000000000000000000010 /* Sources */,
+				A10000000000000000000011 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = StatusBarPlugin;
+			productName = StatusBarPlugin;
+			productReference = A10000000000000000000006 /* StatusBarPlugin.bundle */;
+			productType = "com.apple.product-type.bundle";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -145,6 +217,9 @@
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					D12345678901234567890132 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					A10000000000000000000009 = {
 						CreatedOnToolsVersion = 15.0;
 					};
 					D12345678901234567890157 = {
@@ -168,6 +243,7 @@
 			targets = (
 				D12345678901234567890132 /* HomeKitSync */,
 				D12345678901234567890157 /* HomeKitSyncTests */,
+				A10000000000000000000009 /* StatusBarPlugin */,
 			);
 		};
 /* End PBXProject section */
@@ -198,6 +274,7 @@
 				D12345678901234567890143 /* MCPServer.swift in Sources */,
 				D12345678901234567890147 /* HTTPMCPServer.swift in Sources */,
 				D12345678901234567890151 /* HomeKitManager.swift in Sources */,
+				A10000000000000000000002 /* StatusBarBridge.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -210,6 +287,15 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A10000000000000000000010 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000005 /* StatusBarController.swift in Sources */,
+				A10000000000000000000003 /* StatusBarBridge.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -217,6 +303,12 @@
 			isa = PBXTargetDependency;
 			target = D12345678901234567890132 /* HomeKitSync */;
 			targetProxy = D12345678901234567890154 /* PBXContainerItemProxy */;
+		};
+		A10000000000000000000013 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilter = maccatalyst;
+			target = A10000000000000000000009 /* StatusBarPlugin */;
+			targetProxy = A10000000000000000000012 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -433,6 +525,54 @@
 			};
 			name = Release;
 		};
+		A10000000000000000000015 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSPrincipalClass = HKMStatusBarController;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Bundles";
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.machadolucas.homekit-mcp.statusbar";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				WRAPPER_EXTENSION = bundle;
+			};
+			name = Debug;
+		};
+		A10000000000000000000016 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSPrincipalClass = HKMStatusBarController;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Bundles";
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.machadolucas.homekit-mcp.statusbar";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				WRAPPER_EXTENSION = bundle;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -459,6 +599,15 @@
 			buildConfigurations = (
 				D12345678901234567890162 /* Debug */,
 				D12345678901234567890163 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000000000000000000014 /* Build configuration list for PBXNativeTarget "StatusBarPlugin" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000015 /* Debug */,
+				A10000000000000000000016 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
